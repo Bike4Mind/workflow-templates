@@ -64,9 +64,9 @@ runs:
           # Captures stdout+stderr to allow output inspection. Returns non-zero
           # on either a non-zero sst exit OR a "✕ Failed" / "| Error" marker
           # in the output. SST sometimes reports resource-level failures in
-          # its progress UI while still exiting 0 (see Starlight pr46 cleanup:
-          # DeleteAuthorizer ConflictException, sst exit 0). Without this
-          # parse, the cleanup workflow lies about success.
+          # its progress UI while still exiting 0 (observed: DeleteAuthorizer
+          # ConflictException with sst exit 0). Without this parse, the
+          # cleanup workflow lies about success.
           OUTPUT=$(pnpm sst remove --stage "${STAGE}" --yes 2>&1)
           REMOVE_EXIT=$?
           echo "$OUTPUT"
@@ -84,8 +84,8 @@ runs:
         # Capture attempt_remove's exit code directly. We can't use
         # `if attempt_remove; then ... fi; EXIT_CODE=$?` because bash
         # returns 0 from a skipped `if/fi` block, masking the real failure
-        # (this is exactly how the Starlight pr46 cleanup ended up reporting
-        # "exit code: 0" while the workflow showed ✕ Failed earlier).
+        # (this is exactly how a cleanup ended up reporting "exit code: 0"
+        # while the workflow showed ✕ Failed earlier).
         attempt_remove
         EXIT_CODE=$?
 

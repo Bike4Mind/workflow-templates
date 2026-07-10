@@ -93,7 +93,7 @@ jobs:
     # workflow runs; cancel-in-progress: false means the cleanup waits for the
     # deploy to finish, then removes a fully-deployed stage.
     #
-    # Why (vibeswire pr285, 2026-06-15): a PR merged while its preview
+    # Why: a PR merged while its preview
     # `sst deploy` was still running. The cleanup's pre-emptive `sst unlock`
     # released the live deploy's lock and `sst remove` then ran concurrently
     # with the deploy. The two drifted the Pulumi stack, orphaning API Gateway
@@ -164,9 +164,9 @@ jobs:
           ENV="pr${PR_NUMBER}"
           # Mark all deployments on this env inactive and delete them first.
           # Leaving active deployments behind causes GitHub to recreate the
-          # env after we delete it (the regression we hit on vibes-trader
-          # pr139). Listing deployments doesn't error on a missing env, so
-          # this works as a no-op when the env never existed.
+          # env after we delete it (a regression seen in practice). Listing
+          # deployments doesn't error on a missing env, so this works as a
+          # no-op when the env never existed.
           DEPLOYMENTS=$(gh api "repos/${REPO}/deployments?environment=${ENV}&per_page=100" --jq '.[].id' 2>/dev/null || true)
           for id in $DEPLOYMENTS; do
             gh api -X POST "repos/${REPO}/deployments/${id}/statuses" \
