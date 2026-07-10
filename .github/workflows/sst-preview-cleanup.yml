@@ -1,0 +1,220 @@
+name: SST Preview Cleanup (reusable)
+
+# Tears down a per-PR SST stage and deletes its GitHub Environment.
+#
+# Caller should trigger via `pull_request_target: types: [closed]` so the
+# workflow file resolves from the base ref (immune to broken YAML inside the PR).
+#
+# Required org-level vars/secrets:
+#   - vars.B4M_CI_BOT_APP_ID
+#   - secrets.B4M_CI_BOT_PRIVATE_KEY
+# (b4m-ci-bot must have the calling repo added to its installation.)
+#
+# Required per-consumer:
+#   - GitHub Environment named matching `cleanup_env` input (default
+#     `preview_cleanup`) with `secrets.AWS_ROLE_ARN` set. The cleanup job
+#     binds here for credential scoping; it MUST NOT be the same env the
+#     job is deleting (`pr<N>`) or the DELETE silently fails / recreates.
+#
+# Optional secrets: SLACK_WEBHOOK_URL (only required when notify_slack=true)
+
+on:
+  workflow_call:
+    inputs:
+      sst_app:
+        required: true
+        type: string
+      aws_region:
+        required: false
+        type: string
+        default: us-east-2
+      node_version:
+        required: false
+        type: string
+        default: '22.x'
+      pnpm_version:
+        required: false
+        type: string
+        default: '10.29.3'
+      cleanup_timeout_minutes:
+        required: false
+        type: number
+        default: 30
+      notify_slack:
+        description: When true, post a Slack alert if cleanup fails. Requires SLACK_WEBHOOK_URL.
+        required: false
+        type: boolean
+        default: false
+      slack_mention:
+        description: Slack mention prefix for cleanup failure notifications.
+        required: false
+        type: string
+        default: '@here'
+      cleanup_env:
+        description: |
+          GitHub Environment name the cleanup job binds to for secret scoping
+          (e.g. AWS_ROLE_ARN). MUST NOT be the same env the job is deleting.
+          Defaults to 'preview_cleanup'. Create this env once per consumer
+          repo and add AWS_ROLE_ARN to it. See README for setup.
+        required: false
+        type: string
+        default: preview_cleanup
+
+env:
+  AWS_REGION: ${{ inputs.aws_region }}
+  NODE_VERSION: ${{ inputs.node_version }}
+  PNPM_VERSION: ${{ inputs.pnpm_version }}
+
+jobs:
+  cleanup:
+    name: Remove preview stage and environment
+    # Skip dependabot, release-please branches, and main->prod release PRs.
+    if: |
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      !startsWith(github.event.pull_request.head.ref, 'release-please') &&
+      !(github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'prod')
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.cleanup_timeout_minutes }}
+    # Bind to a dedicated env (default 'preview_cleanup'), NOT the pr<N> env
+    # the job is about to delete. Binding to the deletion target creates an
+    # active deployment record that either blocks the DELETE or causes GitHub
+    # to recreate the env after deletion. See workflow-templates#<TBD>.
+    environment:
+      name: ${{ inputs.cleanup_env }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      deployments: write
+    # Share the deploy preview job's concurrency group (sst-deploy.yml
+    # `preview-deploy`: deploy-pr<N>) so a merge-triggered cleanup QUEUES
+    # behind an in-flight preview deploy instead of racing it. Concurrency
+    # groups are repo-wide by name, so this serializes across the two separate
+    # workflow runs; cancel-in-progress: false means the cleanup waits for the
+    # deploy to finish, then removes a fully-deployed stage.
+    #
+    # Why (vibeswire pr285, 2026-06-15): a PR merged while its preview
+    # `sst deploy` was still running. The cleanup's pre-emptive `sst unlock`
+    # released the live deploy's lock and `sst remove` then ran concurrently
+    # with the deploy. The two drifted the Pulumi stack, orphaning API Gateway
+    # routes + Lambdas in AWS that state no longer tracked, which blocked every
+    # integration delete with `ConflictException: ... referenced by Routes [..]`
+    # on every re-run (it could never self-heal). Serializing closes the window.
+    concurrency:
+      group: deploy-pr${{ github.event.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      # The cleanup checks out the PR's BASE ref. A PR opened before the
+      # consuming repo's first app landed on its base branch (a bootstrap PR)
+      # has no package.json / sst.config.ts on that base, so pnpm install and
+      # sst remove cannot run. Detect that and skip the app-dependent steps,
+      # while STILL deleting the GitHub Environment below (pure gh api, no app
+      # needed). This turns a benign bootstrap-PR close into a clean no-op
+      # instead of a red-failed cleanup + false #infra page. Normal PRs (app
+      # present on the base) take the unchanged full-teardown path.
+      - name: Detect deployable app on base ref
+        id: guard
+        run: |
+          if [ -f package.json ] && [ -f sst.config.ts ]; then
+            echo "has_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Base ref has no app (package.json/sst.config.ts absent); skipping sst remove, will still delete the GitHub Environment."
+          fi
+      - uses: pnpm/action-setup@v6
+        if: steps.guard.outputs.has_app == 'true'
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        if: steps.guard.outputs.has_app == 'true'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+      - if: steps.guard.outputs.has_app == 'true'
+        run: pnpm install --frozen-lockfile
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: steps.guard.outputs.has_app == 'true'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}-pr${{ github.event.number }}-cleanup
+      - name: Remove preview stage (idempotent)
+        if: steps.guard.outputs.has_app == 'true'
+        uses: Bike4Mind/workflow-templates/.github/actions/sst-remove-idempotent@main
+        with:
+          stage: pr${{ github.event.number }}
+          capture_mongodb_uri: 'false'
+        env:
+          SEED_APP_NAME: ${{ inputs.sst_app }}
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.B4M_CI_BOT_APP_ID }}
+          private-key: ${{ secrets.B4M_CI_BOT_PRIVATE_KEY }}
+      - name: Delete GitHub Environment
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          set -euo pipefail
+          ENV="pr${PR_NUMBER}"
+          # Mark all deployments on this env inactive and delete them first.
+          # Leaving active deployments behind causes GitHub to recreate the
+          # env after we delete it (the regression we hit on vibes-trader
+          # pr139). Listing deployments doesn't error on a missing env, so
+          # this works as a no-op when the env never existed.
+          DEPLOYMENTS=$(gh api "repos/${REPO}/deployments?environment=${ENV}&per_page=100" --jq '.[].id' 2>/dev/null || true)
+          for id in $DEPLOYMENTS; do
+            gh api -X POST "repos/${REPO}/deployments/${id}/statuses" \
+              -f state=inactive >/dev/null 2>&1 || true
+            gh api -X DELETE "repos/${REPO}/deployments/${id}" >/dev/null 2>&1 || true
+          done
+          # Delete the env. Treat 404 as success (idempotent re-runs / PR
+          # that closed before its first preview deploy). Any other failure
+          # propagates and fails the job loudly. We rely on gh's exit code +
+          # stderr message instead of probing first, because the bot token's
+          # read permission on environments is inconsistent on some installs.
+          if OUT=$(gh api -X DELETE "repos/${REPO}/environments/${ENV}" 2>&1); then
+            echo "Environment ${ENV} deleted."
+          elif echo "$OUT" | grep -q "Not Found"; then
+            echo "Environment ${ENV} not present (already gone)."
+          else
+            echo "Failed to delete environment ${ENV}:"
+            echo "$OUT"
+            exit 1
+          fi
+      - name: Comment PR with cleanup confirmation
+        if: success()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: 'Preview environment removed.'
+            });
+
+  notify-cleanup-failure:
+    name: Notify cleanup failure
+    needs: cleanup
+    if: |
+      always() &&
+      inputs.notify_slack &&
+      (needs.cleanup.result == 'failure' || needs.cleanup.result == 'cancelled')
+    uses: Bike4Mind/workflow-templates/.github/workflows/notify-cleanup-failure.yml@main
+    with:
+      pr_number: ${{ github.event.number }}
+      pr_title: ${{ github.event.pull_request.title }}
+      pr_author: ${{ github.event.pull_request.user.login }}
+      pr_url: ${{ github.event.pull_request.html_url }}
+      stage_name: pr${{ github.event.number }}
+      repository: ${{ github.repository }}
+      workflow_run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      mention: ${{ inputs.slack_mention }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,71 @@
+name: Notify Deploy Result
+
+on:
+  workflow_call:
+    inputs:
+      deploy_outcome:
+        description: 'Outcome of the deploy job. Pass needs.deploy.result (one of: success, failure, cancelled, skipped).'
+        required: true
+        type: string
+      environment:
+        description: 'Environment name (e.g. production)'
+        required: true
+        type: string
+      workflow_file:
+        description: 'Filename or display name shown in the notification header. e.g. deploy.yml'
+        required: false
+        type: string
+        default: ''
+      repository:
+        description: 'Repository name (owner/repo). Defaults to caller repo.'
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: 'Branch name. Defaults to caller ref_name.'
+        required: false
+        type: string
+        default: ''
+      commit_sha:
+        required: false
+        type: string
+        default: ''
+      commit_message:
+        required: false
+        type: string
+        default: ''
+      commit_author:
+        required: false
+        type: string
+        default: ''
+      commit_url:
+        required: false
+        type: string
+        default: ''
+      workflow_run_url:
+        description: 'URL of the current run.'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SLACK_DEPLOY_WEBHOOK_URL:
+        description: 'Webhook URL of the Slack channel that receives deploy notifications. Set this at the consumer repo level pointing at your deploy channel.'
+        required: true
+
+jobs:
+  notify:
+    if: inputs.deploy_outcome == 'success' || inputs.deploy_outcome == 'failure' || inputs.deploy_outcome == 'cancelled'
+    uses: ./.github/workflows/slack-notify.yml
+    with:
+      status: ${{ inputs.deploy_outcome }}
+      environment: ${{ inputs.environment }}
+      workflow_name: ${{ inputs.workflow_file }}
+      repository: ${{ inputs.repository }}
+      branch: ${{ inputs.branch }}
+      commit_sha: ${{ inputs.commit_sha }}
+      commit_message: ${{ inputs.commit_message }}
+      commit_author: ${{ inputs.commit_author }}
+      commit_url: ${{ inputs.commit_url }}
+      workflow_run_url: ${{ inputs.workflow_run_url }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
