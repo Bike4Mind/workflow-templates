@@ -38,9 +38,15 @@ on:
         type: string
         default: main
       preview_domain:
-        description: Apex domain for PR previews. Comment will link to https://<stage>.<preview_domain>
-        required: true
+        description: Apex domain for PR previews. Comment links to https://<stage>.<preview_domain>. Unused when previews=false.
+        required: false
         type: string
+        default: ''
+      previews:
+        description: When false, PR preview deploys are skipped entirely (the preview-deploy job never runs). Validate still runs on PRs. Defaults true.
+        required: false
+        type: boolean
+        default: true
       staging_url:
         description: Public URL of the staging deploy (e.g. https://dev.example.com). When empty, the staging environment URL is omitted.
         required: false
@@ -322,7 +328,7 @@ jobs:
   preview-deploy:
     name: Deploy PR preview
     needs: validate
-    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: inputs.previews && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     environment:
