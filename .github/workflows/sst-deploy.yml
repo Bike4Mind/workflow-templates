@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       staging_stage:
-        description: SST stage name for the staging deploy (e.g. dev, vibeswire-dev)
+        description: SST stage name for the staging deploy (e.g. dev, staging)
         required: true
         type: string
       staging_env:
@@ -25,7 +25,7 @@ on:
         required: true
         type: string
       prod_stage:
-        description: SST stage name for the production deploy (e.g. production, vibes-trader-prod)
+        description: SST stage name for the production deploy (e.g. production)
         required: true
         type: string
       prod_env:
