@@ -1,0 +1,467 @@
+name: SST Deploy (reusable)
+
+# Reusable deploy pipeline for SST 3.x apps in the Bike4Mind org.
+# See README for shim examples and caller setup.
+#
+# Required inputs:  sst_app, staging_stage, staging_env, prod_stage, prod_env, preview_domain
+# Required secrets: AWS_ROLE_ARN (set per-environment AND at repo level for
+#                   previews); caller passes `secrets: inherit`
+#
+# Optional secrets: SLACK_DEPLOY_WEBHOOK_URL (only required when notify_slack=true)
+
+on:
+  workflow_call:
+    inputs:
+      sst_app:
+        description: SST app name (matches `name` returned by sst.config.ts)
+        required: true
+        type: string
+      staging_stage:
+        description: SST stage name for the staging deploy (e.g. dev, vibeswire-dev)
+        required: true
+        type: string
+      staging_env:
+        description: GitHub Environment name for staging (controls AWS_ROLE_ARN scoping)
+        required: true
+        type: string
+      prod_stage:
+        description: SST stage name for the production deploy (e.g. production, vibes-trader-prod)
+        required: true
+        type: string
+      prod_env:
+        description: GitHub Environment name for production
+        required: true
+        type: string
+      prod_branch:
+        description: Branch that triggers production deploys
+        required: false
+        type: string
+        default: main
+      preview_domain:
+        description: Apex domain for PR previews. Comment will link to https://<stage>.<preview_domain>
+        required: true
+        type: string
+      staging_url:
+        description: Public URL of the staging deploy (e.g. https://dev.example.com). When empty, the staging environment URL is omitted.
+        required: false
+        type: string
+        default: ''
+      prod_url:
+        description: Public URL of the production deploy (e.g. https://www.example.com). When empty, the production environment URL is omitted.
+        required: false
+        type: string
+        default: ''
+      aws_region:
+        required: false
+        type: string
+        default: us-east-2
+      node_version:
+        required: false
+        type: string
+        default: '22.x'
+      pnpm_version:
+        required: false
+        type: string
+        default: '10.29.3'
+      validate_command:
+        description: Shell command run in the validate job (after pnpm install)
+        required: false
+        type: string
+        default: pnpm type-check
+      pre_deploy_command:
+        description: Shell command run before each `sst deploy`. Use to seed per-stage secrets, force preview-only overrides, etc. Has $STAGE in the env.
+        required: false
+        type: string
+        default: ''
+      post_deploy_command:
+        description: Shell command run after a successful `sst deploy`. Use for smoke tests / health checks. Has $STAGE in the env. Failure fails the job.
+        required: false
+        type: string
+        default: ''
+      deploy_timeout_minutes:
+        description: Per-deploy-job timeout
+        required: false
+        type: number
+        default: 60
+      notify_slack:
+        description: When true, post a Slack card for every prod deploy completion (success/failure/cancelled). Requires SLACK_DEPLOY_WEBHOOK_URL secret.
+        required: false
+        type: boolean
+        default: false
+      slack_mention:
+        description: Deprecated. The deploy notification channel is now properly scoped so group mentions are unnecessary. This input is ignored.
+        required: false
+        type: string
+        default: ''
+
+env:
+  AWS_REGION: ${{ inputs.aws_region }}
+  NODE_VERSION: ${{ inputs.node_version }}
+  PNPM_VERSION: ${{ inputs.pnpm_version }}
+
+jobs:
+  validate:
+    name: Validate
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+      - name: Configure npm auth (private @bike4mind/* packages)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          fi
+      - run: pnpm install --frozen-lockfile
+      - name: Validate
+        env:
+          VALIDATE_CMD: ${{ inputs.validate_command }}
+        run: bash -c "$VALIDATE_CMD"
+
+  deploy-staging:
+    name: Deploy staging
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
+    environment:
+      name: ${{ inputs.staging_env }}
+      url: ${{ inputs.staging_url }}
+    permissions:
+      id-token: write
+      contents: read
+      deployments: write
+    concurrency:
+      group: deploy-${{ inputs.staging_env }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+      - name: Configure npm auth (private @bike4mind/* packages)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          fi
+      - run: pnpm install --frozen-lockfile
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}-${{ inputs.staging_stage }}
+      - name: Pre-deploy
+        if: inputs.pre_deploy_command != ''
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: ${{ inputs.staging_stage }}
+          PRE_DEPLOY_CMD: ${{ inputs.pre_deploy_command }}
+        run: bash -c "$PRE_DEPLOY_CMD"
+      - name: Deploy
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: ${{ inputs.staging_stage }}
+        run: pnpm sst deploy --stage "$STAGE"
+      - name: Unlock SST state on failure
+        if: failure() || cancelled()
+        env:
+          STAGE: ${{ inputs.staging_stage }}
+        run: |
+          echo "Deploy failed; attempting to unlock SST state for $STAGE"
+          sleep 15
+          pnpm sst unlock --stage "$STAGE" || echo "Unlock failed or no lock present"
+      - name: Post-deploy
+        if: success() && inputs.post_deploy_command != ''
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: ${{ inputs.staging_stage }}
+          POST_DEPLOY_CMD: ${{ inputs.post_deploy_command }}
+        run: bash -c "$POST_DEPLOY_CMD"
+      - name: Create deployment record
+        if: success()
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          DEPLOY_ENV: ${{ inputs.staging_env }}
+          DEPLOY_URL: ${{ inputs.staging_url }}
+        with:
+          script: |
+            const env = process.env.DEPLOY_ENV;
+            const url = process.env.DEPLOY_URL;
+            const dep = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: env,
+              auto_merge: false,
+              required_contexts: [],
+              transient_environment: false,
+              production_environment: false,
+            });
+            if (dep.data?.id) {
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: dep.data.id,
+                state: 'success',
+                environment_url: url,
+              });
+            }
+
+  deploy-production:
+    name: Deploy production
+    needs: validate
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.prod_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
+    environment:
+      name: ${{ inputs.prod_env }}
+      url: ${{ inputs.prod_url }}
+    permissions:
+      id-token: write
+      contents: read
+      deployments: write
+    concurrency:
+      group: deploy-${{ inputs.prod_env }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+      - name: Configure npm auth (private @bike4mind/* packages)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          fi
+      - run: pnpm install --frozen-lockfile
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}-${{ inputs.prod_stage }}
+      - name: Pre-deploy
+        if: inputs.pre_deploy_command != ''
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: ${{ inputs.prod_stage }}
+          PRE_DEPLOY_CMD: ${{ inputs.pre_deploy_command }}
+        run: bash -c "$PRE_DEPLOY_CMD"
+      - name: Deploy
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: ${{ inputs.prod_stage }}
+        run: pnpm sst deploy --stage "$STAGE"
+      - name: Unlock SST state on failure
+        if: failure() || cancelled()
+        env:
+          STAGE: ${{ inputs.prod_stage }}
+        run: |
+          echo "Deploy failed; attempting to unlock SST state for $STAGE"
+          sleep 15
+          pnpm sst unlock --stage "$STAGE" || echo "Unlock failed or no lock present"
+      - name: Post-deploy
+        if: success() && inputs.post_deploy_command != ''
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: ${{ inputs.prod_stage }}
+          POST_DEPLOY_CMD: ${{ inputs.post_deploy_command }}
+        run: bash -c "$POST_DEPLOY_CMD"
+      - name: Create deployment record
+        if: success()
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          DEPLOY_ENV: ${{ inputs.prod_env }}
+          DEPLOY_URL: ${{ inputs.prod_url }}
+        with:
+          script: |
+            const env = process.env.DEPLOY_ENV;
+            const url = process.env.DEPLOY_URL;
+            const dep = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: env,
+              auto_merge: false,
+              required_contexts: [],
+              transient_environment: false,
+              production_environment: true,
+            });
+            if (dep.data?.id) {
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: dep.data.id,
+                state: 'success',
+                environment_url: url,
+              });
+            }
+
+  preview-deploy:
+    name: Deploy PR preview
+    needs: validate
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
+    environment:
+      name: pr${{ github.event.number }}
+      url: https://pr${{ github.event.number }}.${{ inputs.preview_domain }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      deployments: write
+    concurrency:
+      group: deploy-pr${{ github.event.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+      - name: Configure npm auth (private @bike4mind/* packages)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          fi
+      - run: pnpm install --frozen-lockfile
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}-pr${{ github.event.number }}
+      - name: Verify PR is still open
+        uses: Bike4Mind/workflow-templates/.github/actions/verify-pr-open@main
+        with:
+          pr_number: ${{ github.event.number }}
+          github_token: ${{ github.token }}
+      - name: Pre-deploy
+        if: inputs.pre_deploy_command != ''
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: pr${{ github.event.number }}
+          PRE_DEPLOY_CMD: ${{ inputs.pre_deploy_command }}
+        run: bash -c "$PRE_DEPLOY_CMD"
+      - name: Deploy
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: pr${{ github.event.number }}
+        run: pnpm sst deploy --stage "$STAGE"
+      - name: Unlock SST state on failure
+        if: failure() || cancelled()
+        env:
+          STAGE: pr${{ github.event.number }}
+        run: |
+          echo "Deploy failed; attempting to unlock SST state for $STAGE"
+          sleep 15
+          pnpm sst unlock --stage "$STAGE" || echo "Unlock failed or no lock present"
+      - name: Post-deploy
+        if: success() && inputs.post_deploy_command != ''
+        env:
+          SST_APP: ${{ inputs.sst_app }}
+          STAGE: pr${{ github.event.number }}
+          POST_DEPLOY_CMD: ${{ inputs.post_deploy_command }}
+        run: bash -c "$POST_DEPLOY_CMD"
+      - name: Comment PR with preview URL
+        if: success()
+        uses: actions/github-script@v8
+        env:
+          STAGE: pr${{ github.event.number }}
+          PREVIEW_DOMAIN: ${{ inputs.preview_domain }}
+        with:
+          script: |
+            const stage = process.env.STAGE;
+            const url = `https://${stage}.${process.env.PREVIEW_DOMAIN}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `Preview deployed to stage \`${stage}\`: ${url}`
+            });
+      - name: Create deployment record
+        if: success()
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+          PREVIEW_DOMAIN: ${{ inputs.preview_domain }}
+        with:
+          script: |
+            const pr = process.env.PR_NUMBER;
+            const env = `pr${pr}`;
+            const url = `https://${env}.${process.env.PREVIEW_DOMAIN}`;
+            const dep = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.payload.pull_request.head.sha,
+              environment: env,
+              auto_merge: false,
+              required_contexts: [],
+              transient_environment: true,
+              production_environment: false,
+            });
+            if (dep.data?.id) {
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: dep.data.id,
+                state: 'success',
+                environment_url: url,
+              });
+            }
+
+  # ============================================================
+  # Production notify: post a Slack card on every prod deploy completion
+  # (success / failure / cancelled). Steady-state pings included on purpose;
+  # the channel is intended as the source of truth for deploy state.
+  # See b4m-infra#175 for history.
+  # ============================================================
+  prod-notify:
+    name: Slack notify (prod)
+    needs: deploy-production
+    if: |
+      always() &&
+      inputs.notify_slack &&
+      needs.deploy-production.result != 'skipped'
+    uses: ./.github/workflows/notify-deploy-result.yml
+    with:
+      deploy_outcome: ${{ needs.deploy-production.result }}
+      environment: Production
+      workflow_file: Deployment
+      repository: ${{ github.repository }}
+      branch: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
+      commit_message: ${{ github.event.head_commit.message }}
+      commit_author: ${{ github.event.head_commit.author.name }}
+      commit_url: ${{ github.event.head_commit.url }}
+      workflow_run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    secrets:
+      SLACK_DEPLOY_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
