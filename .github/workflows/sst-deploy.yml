@@ -136,7 +136,7 @@ jobs:
   deploy-staging:
     name: Deploy staging
     needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     environment:
@@ -232,7 +232,7 @@ jobs:
   deploy-production:
     name: Deploy production
     needs: validate
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.prod_branch)
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', inputs.prod_branch)
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     environment:
