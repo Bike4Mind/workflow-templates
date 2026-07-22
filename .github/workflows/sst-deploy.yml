@@ -37,6 +37,16 @@ on:
         required: false
         type: string
         default: main
+      validate_runner:
+        description: runs-on label for the validate job. Defaults to the GitHub-hosted runner; pass a self-hosted fleet label (e.g. from vars.RUNNER_LABEL) to move validation off hosted minutes.
+        required: false
+        type: string
+        default: ubuntu-latest
+      deploy_runner:
+        description: runs-on label for the deploy-staging / deploy-production / preview-deploy jobs. Defaults to the GitHub-hosted runner; pass a self-hosted fleet label (e.g. from vars.RUNNER_LABEL_MEDIUM) to move deploys off hosted minutes.
+        required: false
+        type: string
+        default: ubuntu-latest
       preview_domain:
         description: Apex domain for PR previews. Comment links to https://<stage>.<preview_domain>. Unused when previews=false.
         required: false
@@ -109,7 +119,7 @@ jobs:
   validate:
     name: Validate
     if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.validate_runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -137,7 +147,7 @@ jobs:
     name: Deploy staging
     needs: validate
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     environment:
       name: ${{ inputs.staging_env }}
@@ -233,7 +243,7 @@ jobs:
     name: Deploy production
     needs: validate
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', inputs.prod_branch)
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     environment:
       name: ${{ inputs.prod_env }}
@@ -329,7 +339,7 @@ jobs:
     name: Deploy PR preview
     needs: validate
     if: inputs.previews && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     environment:
       name: pr${{ github.event.number }}
