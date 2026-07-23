@@ -1,0 +1,59 @@
+name: Overlay Release (reusable)
+
+# Reusable auto-release for Bike4Mind premium overlays (usable by any repo that
+# wants dumb, date-based tags). On the caller's push to main, cuts a CalVer tag
+# and a GitHub Release. No semver, no version files, no conventional commits.
+#
+# Tag scheme: <tag_prefix>YYYY.MM.DD.<github.run_number> in UTC, e.g. v2026.07.23.42
+# run_number is monotonic per workflow (it does not reset daily) — accepted for zero config.
+#
+# Auth: the automatic GITHUB_TOKEN with contents: write. No App token: the overlays
+# have no tag-protection ruleset, so GITHUB_TOKEN may create tags/releases directly.
+#
+# Caller shim (in the overlay repo, .github/workflows/release.yml):
+#   name: Release
+#   on:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: write
+#   jobs:
+#     release:
+#       uses: Bike4Mind/workflow-templates/.github/workflows/overlay-release.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      tag_prefix:
+        description: Prefix placed before the date in the tag/release name.
+        required: false
+        type: string
+        default: v
+      runner:
+        description: runs-on label for the release job.
+        required: false
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cut tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: |
+          TAG="${TAG_PREFIX}$(date -u +%Y.%m.%d).${RUN_NUMBER}"
+          echo "Creating release ${TAG} at ${SHA}"
+          gh release create "${TAG}" \
+            --target "${SHA}" \
+            --title "${TAG}" \
+            --generate-notes
