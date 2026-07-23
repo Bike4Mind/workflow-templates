@@ -7,6 +7,9 @@ name: Overlay Release (reusable)
 # Tag scheme: <tag_prefix>YYYY.MM.DD.<github.run_number> in UTC, e.g. v2026.07.23.42
 # run_number is monotonic per workflow (it does not reset daily) — accepted for zero config.
 #
+# Runner: uses the caller's vars.RUNNER_LABEL (self-hosted fleet); GitHub-hosted
+# ubuntu-latest is the fallback only.
+#
 # Auth: the automatic GITHUB_TOKEN with contents: write. No App token: the overlays
 # have no tag-protection ruleset, so GITHUB_TOKEN may create tags/releases directly.
 #
@@ -29,15 +32,10 @@ on:
         required: false
         type: string
         default: v
-      runner:
-        description: runs-on label for the release job.
-        required: false
-        type: string
-        default: ubuntu-latest
 
 jobs:
   release:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: write
     steps:
