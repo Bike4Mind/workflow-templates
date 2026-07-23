@@ -60,7 +60,7 @@ on:
         type: string
         default: '24'
       extra_packages:
-        description: Space-separated pnpm filter names to additionally typecheck:fast + test (e.g. "@bike4mind/cc-bridge"). Default none.
+        description: Space-separated pnpm filter names to additionally typecheck:fast + test (e.g. "@scope/extra-package"). Default none.
         required: false
         type: string
         default: ''
