@@ -1,0 +1,158 @@
+name: Overlay CI (reusable)
+
+# Reusable CI for Bike4Mind premium overlays. Checks out a HOST monorepo, places
+# this overlay at packages/premium/<overlay_name>/, installs, builds core, generates
+# SST types, then typechecks + tests the overlay package (plus any extra_packages).
+#
+# Host modes:
+#   - Public host  (use_host_app_token=false): checkout with the overlay's github.token.
+#   - Private host (use_host_app_token=true):  mint an App token from
+#     vars.PREMIUM_OVERLAY_CLIENT_ID + secrets.PREMIUM_OVERLAY_APP_PRIVATE_KEY, scoped
+#     to the host repo, and check out with it. Caller MUST pass `secrets: inherit`.
+#
+# Nothing private lives here: host repo, overlay name, node version and extra packages
+# all arrive as call-time inputs from the caller shim in the (private) overlay repo.
+#
+# Caller shim (in the overlay repo, .github/workflows/ci.yml):
+#   name: CI
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#   concurrency:
+#     group: ${{ github.workflow }}-${{ github.ref }}
+#     cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+#   jobs:
+#     ci:
+#       uses: Bike4Mind/workflow-templates/.github/workflows/overlay-ci.yml@main
+#       secrets: inherit
+#       with:
+#         host_repo: <owner/repo>
+#         overlay_name: <name>
+#         use_host_app_token: <bool>
+#         node_version: '<ver>'
+#         extra_packages: '<space-separated pnpm filters>'   # optional
+
+on:
+  workflow_call:
+    inputs:
+      host_repo:
+        description: owner/repo of the host monorepo this overlay composes into.
+        required: true
+        type: string
+      overlay_name:
+        description: Overlay short name. Placed at packages/premium/<overlay_name>; tested as @bike4mind/premium-<overlay_name>.
+        required: true
+        type: string
+      host_ref:
+        description: Ref of the host repo to check out.
+        required: false
+        type: string
+        default: main
+      use_host_app_token:
+        description: When true, mint the PREMIUM_OVERLAY App token to check out the host (required for private hosts). When false, use the overlay's github.token (public hosts).
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        description: Node.js version.
+        required: false
+        type: string
+        default: '24'
+      extra_packages:
+        description: Space-separated pnpm filter names to additionally typecheck:fast + test (e.g. "@scope/extra-package"). Default none.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  ci:
+    name: Typecheck & Test
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Parse host repo
+        id: host
+        env:
+          HOST_REPO: ${{ inputs.host_repo }}
+        run: |
+          echo "owner=${HOST_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${HOST_REPO##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint host App token
+        id: host-token
+        if: ${{ inputs.use_host_app_token }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.PREMIUM_OVERLAY_CLIENT_ID }}
+          private-key: ${{ secrets.PREMIUM_OVERLAY_APP_PRIVATE_KEY }}
+          owner: ${{ steps.host.outputs.owner }}
+          repositories: ${{ steps.host.outputs.name }}
+
+      # For a public host the mint step is skipped, so the token output is empty
+      # and checkout falls back to the overlay's github.token (which reads public
+      # repos fine). For a private host, the App token is used.
+      - name: Checkout host
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.host_repo }}
+          ref: ${{ inputs.host_ref }}
+          token: ${{ steps.host-token.outputs.token || github.token }}
+
+      # Hosts gitignore packages/premium/*, so there is no committed snapshot; this
+      # is a defensive no-op that guarantees the checkout below owns the path.
+      - name: Clear overlay path
+        run: rm -rf packages/premium/${{ inputs.overlay_name }}
+
+      # Place THIS overlay's source at the expected workspace path (the caller repo).
+      - name: Checkout overlay
+        uses: actions/checkout@v6
+        with:
+          path: packages/premium/${{ inputs.overlay_name }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Cache pnpm dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile --recursive
+
+      - name: Build core packages
+        run: pnpm core:build
+
+      - name: Generate SST types
+        run: pnpm sst install
+        env:
+          CI: 'true'
+
+      - name: Typecheck
+        run: pnpm --filter @bike4mind/premium-${{ inputs.overlay_name }} run typecheck:fast
+
+      - name: Test
+        run: pnpm --filter @bike4mind/premium-${{ inputs.overlay_name }} run test
+
+      - name: Typecheck + test extra packages
+        if: ${{ inputs.extra_packages != '' }}
+        env:
+          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+        run: |
+          for pkg in ${EXTRA_PACKAGES}; do
+            echo "== ${pkg} =="
+            pnpm --filter "${pkg}" run typecheck:fast
+            pnpm --filter "${pkg}" run test
+          done
