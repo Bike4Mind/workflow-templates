@@ -55,6 +55,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # NOTE: relies on workflow-templates being PUBLIC — the default GITHUB_TOKEN
+      # cannot read a different private repo. If this repo ever goes private, pass
+      # a token/App with read access here or overlay releases will fail with 403.
       - name: Fetch the version script from workflow-templates
         uses: actions/checkout@v6
         with:
@@ -72,19 +75,22 @@ jobs:
           set -euo pipefail
 
           # Highest strict-SemVer tag (ignores legacy CalVer vYYYY.MM.DD.N).
+          # Assumes TAG_PREFIX is glob/regex/sed-safe (default 'v' is); a prefix
+          # with . / or * would misbehave in the tag glob and the sed strip.
           LAST_VERSION="$(git tag -l "${TAG_PREFIX}*" \
             | sed "s/^${TAG_PREFIX}//" \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V | tail -1 || true)"
 
-          if [ -n "$LAST_VERSION" ]; then
-            RANGE="${TAG_PREFIX}${LAST_VERSION}..HEAD"
-            echo "Last SemVer tag: ${TAG_PREFIX}${LAST_VERSION}"
-          else
-            RANGE="HEAD"
-            LAST_VERSION="0.0.0"
-            echo "No SemVer tag yet; baseline ${LAST_VERSION}"
+          # Defense-in-depth: with no SemVer baseline tag, do NOT scan full history
+          # (that would cut a surprise release on the first post-merge push across
+          # all overlays). No-op until a baseline is deliberately seeded (Task 4).
+          if [ -z "$LAST_VERSION" ]; then
+            echo "::notice::No ${TAG_PREFIX}MAJOR.MINOR.PATCH baseline tag yet; skipping. Seed ${TAG_PREFIX}0.1.0 to enable releases."
+            exit 0
           fi
+          RANGE="${TAG_PREFIX}${LAST_VERSION}..HEAD"
+          echo "Last SemVer tag: ${TAG_PREFIX}${LAST_VERSION}"
 
           NEXT="$(git log "$RANGE" --pretty=%s \
             | bash .workflow-templates/scripts/compute-next-semver.sh "$LAST_VERSION")"
