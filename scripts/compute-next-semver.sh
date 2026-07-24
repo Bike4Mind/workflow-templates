@@ -21,6 +21,9 @@ if ! [[ "$CURRENT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
   exit 2
 fi
 MAJOR="${BASH_REMATCH[1]}"; MINOR="${BASH_REMATCH[2]}"; PATCH="${BASH_REMATCH[3]}"
+# Force base-10: a leading-zero segment (e.g. "08", "010") is otherwise read as
+# octal by $(( )), silently corrupting or erroring the bump. 10# pins decimal.
+MAJOR=$((10#$MAJOR)); MINOR=$((10#$MINOR)); PATCH=$((10#$PATCH))
 
 # conventional-commit subject: type(optional scope)(optional !): <space> description
 conv='^[a-z]+(\([a-zA-Z0-9,/_-]+\))?(!)?:[[:space:]].+'

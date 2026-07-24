@@ -36,6 +36,9 @@ check "major-resets"         "1.2.3" $'feat!: z'                      "2.0.0" 0
 check "multi-scope"          "0.1.0" $'feat(a,b): x'                 "0.2.0" 0
 check "empty-current"        ""      $'feat: x'                       "0.1.0" 0
 check "colon-required"       "0.1.0" $'feat add x'                    ""      0
+check "chore-bang->major"    "0.1.0" $'chore!: boom'                  "1.0.0" 0
+check "leading-zero-patch"   "1.2.08" $'fix: x'                       "1.2.9" 0
+check "leading-zero-minor"   "1.010.3" $'feat: x'                     "1.11.0" 0
 
 # usage error: malformed current version -> exit 2
 printf 'feat: x' | bash "$SUT" "not-a-version" >/dev/null 2>&1; code=$?
