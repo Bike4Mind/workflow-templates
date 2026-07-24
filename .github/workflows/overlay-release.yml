@@ -1,25 +1,30 @@
 name: Overlay Release (reusable)
 
-# Reusable auto-release for Bike4Mind premium overlays (usable by any repo that
-# wants dumb, date-based tags). On the caller's push to main, cuts a CalVer tag
-# and a GitHub Release. No semver, no version files, no conventional commits.
+# Reusable auto-release for Bike4Mind premium overlays. On the caller's push to
+# main, computes the next SemVer from conventional-commit subjects since the last
+# SemVer tag, then cuts <tag_prefix><MAJOR.MINOR.PATCH> + a GitHub Release. No-ops
+# when no commit since the last tag is release-worthy.
 #
-# Tag scheme: <tag_prefix>YYYY.MM.DD.<github.run_number> in UTC, e.g. v2026.07.23.42
-# run_number is monotonic per workflow (it does not reset daily) — accepted for zero config.
+# Bump rules mirror bike4mind core's auto-changeset.yml (max across commits):
+#   type!: / type(scope)!: -> major | feat -> minor | fix|perf|refactor -> patch
+#   everything else (chore/docs/ci/.../non-conventional) is ignored.
 #
-# Runner: uses the caller's vars.RUNNER_LABEL (self-hosted fleet); GitHub-hosted
-# ubuntu-latest is the fallback only.
+# Tag scheme: <tag_prefix>MAJOR.MINOR.PATCH (SemVer), e.g. v0.2.0. Legacy CalVer
+# tags (vYYYY.MM.DD.N) are ignored by the strict-SemVer "last tag" filter and
+# left in place as history.
 #
-# Auth: the automatic GITHUB_TOKEN with contents: write. No App token: the overlays
-# have no tag-protection ruleset, so GITHUB_TOKEN may create tags/releases directly.
+# The bump math lives in scripts/compute-next-semver.sh (unit-tested via
+# scripts-ci). This job checks out that script from workflow-templates at
+# github.job_workflow_sha so it always matches the ref the caller pinned.
 #
-# Caller shim (in the overlay repo, .github/workflows/release.yml):
+# Runner: caller's vars.RUNNER_LABEL (self-hosted fleet); ubuntu-latest fallback.
+# Auth: automatic GITHUB_TOKEN with contents: write (overlays have no
+# tag-protection ruleset, so GITHUB_TOKEN may create tags/releases directly).
+#
+# Caller shim is UNCHANGED (.github/workflows/release.yml in the overlay repo):
 #   name: Release
-#   on:
-#     push:
-#       branches: [main]
-#   permissions:
-#     contents: write
+#   on: { push: { branches: [main] } }
+#   permissions: { contents: write }
 #   jobs:
 #     release:
 #       uses: Bike4Mind/workflow-templates/.github/workflows/overlay-release.yml@main
@@ -28,10 +33,15 @@ on:
   workflow_call:
     inputs:
       tag_prefix:
-        description: Prefix placed before the date in the tag/release name.
+        description: Prefix placed before the version in the tag/release name.
         required: false
         type: string
         default: v
+
+concurrency:
+  # Serialize releases per overlay so two quick merges don't race on "next".
+  group: overlay-release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -39,17 +49,52 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout
+      - name: Checkout overlay (full history + tags)
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Cut tag and GitHub Release
+      - name: Fetch the version script from workflow-templates
+        uses: actions/checkout@v6
+        with:
+          repository: Bike4Mind/workflow-templates
+          ref: ${{ github.job_workflow_sha }}
+          path: .workflow-templates
+          sparse-checkout: scripts
+
+      - name: Compute next version and release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
-          RUN_NUMBER: ${{ github.run_number }}
           SHA: ${{ github.sha }}
         run: |
-          TAG="${TAG_PREFIX}$(date -u +%Y.%m.%d).${RUN_NUMBER}"
+          set -euo pipefail
+
+          # Highest strict-SemVer tag (ignores legacy CalVer vYYYY.MM.DD.N).
+          LAST_VERSION="$(git tag -l "${TAG_PREFIX}*" \
+            | sed "s/^${TAG_PREFIX}//" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1 || true)"
+
+          if [ -n "$LAST_VERSION" ]; then
+            RANGE="${TAG_PREFIX}${LAST_VERSION}..HEAD"
+            echo "Last SemVer tag: ${TAG_PREFIX}${LAST_VERSION}"
+          else
+            RANGE="HEAD"
+            LAST_VERSION="0.0.0"
+            echo "No SemVer tag yet; baseline ${LAST_VERSION}"
+          fi
+
+          NEXT="$(git log "$RANGE" --pretty=%s \
+            | bash .workflow-templates/scripts/compute-next-semver.sh "$LAST_VERSION")"
+
+          if [ -z "$NEXT" ]; then
+            echo "::notice::No release-worthy commits in ${RANGE}; skipping."
+            exit 0
+          fi
+
+          TAG="${TAG_PREFIX}${NEXT}"
           echo "Creating release ${TAG} at ${SHA}"
           gh release create "${TAG}" \
             --target "${SHA}" \
