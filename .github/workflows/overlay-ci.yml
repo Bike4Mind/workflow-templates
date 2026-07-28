@@ -64,6 +64,15 @@ on:
         required: false
         type: string
         default: ''
+      glue_consumers:
+        description: >-
+          Space-separated pnpm filter names of host packages that overlay codegen writes
+          generated files into, and which must therefore still typecheck once this overlay
+          is composed in. Typecheck only, no tests - this gates module RESOLUTION, not
+          behaviour. Defaults to the known consumers; override only to add one.
+        required: false
+        type: string
+        default: '@bike4mind/scripts'
 
 jobs:
   ci:
@@ -145,6 +154,53 @@ jobs:
 
       - name: Test
         run: pnpm --filter @bike4mind/premium-${{ inputs.overlay_name }} run test
+
+      # The overlay's own package compiling is NOT the same question as the
+      # composed workspace compiling. generate-premium-glue.mjs writes generated
+      # files into OTHER host packages, and the imports it emits have to resolve
+      # from THOSE packages' resolution scopes.
+      #
+      # This gate exists because that distinction was first discovered in
+      # production, on 2026-07-28. Bike4Mind/bike4mind#948 emitted the premium
+      # migration glue into packages/scripts - the first generated file to land
+      # outside apps/client - importing each contributing overlay by bare
+      # specifier. A bare specifier resolves only where the overlay package is
+      # linked, which is apps/client alone. The seam shipped inert (the glue is
+      # an empty array until some overlay declares migrationsExport), so nothing
+      # failed until b4m-optihashi declared one. THIS WORKFLOW then composed
+      # exactly that unbuildable workspace, typechecked the overlay by itself,
+      # and went green. The break surfaced ~100 minutes later as a failed
+      # staging deploy, which blocked production promotion.
+      #
+      # Typecheck only, deliberately: the failure mode is an unresolvable module,
+      # which typecheck catches, and running these packages' full suites on every
+      # overlay CI run would cost far more than it finds.
+      - name: Typecheck overlay-glue consumers
+        if: ${{ inputs.glue_consumers != '' }}
+        env:
+          GLUE_CONSUMERS: ${{ inputs.glue_consumers }}
+        run: |
+          set -uo pipefail
+          status=0
+          for pkg in ${GLUE_CONSUMERS}; do
+            echo "== ${pkg} =="
+            if ! out=$(pnpm --filter "${pkg}" run typecheck:fast 2>&1); then
+              printf '%s\n' "${out}"
+              echo "::error::${pkg} does not typecheck with overlay ${{ inputs.overlay_name }} composed in. If this is an unresolvable @bike4mind/premium-* import, the generated glue in that package needs a relative import (see generateInfraGlue) or the package needs the overlay wired into its deps."
+              status=1
+              continue
+            fi
+            printf '%s\n' "${out}"
+            # pnpm exits 0 when the filter matches a package that simply has no
+            # such script. Silently passing would turn this gate off without
+            # anyone noticing - which is the exact class of failure it exists to
+            # catch - so treat it as a hard error.
+            if printf '%s' "${out}" | grep -q "None of the selected packages has a script"; then
+              echo "::error::${pkg} has no typecheck:fast script, so this gate is not gating. Fix the filter name or add the script."
+              status=1
+            fi
+          done
+          exit "${status}"
 
       - name: Typecheck + test extra packages
         if: ${{ inputs.extra_packages != '' }}
