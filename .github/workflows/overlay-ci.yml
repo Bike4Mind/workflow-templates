@@ -138,8 +138,72 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-
 
+      # The host gitignores packages/premium/*, so its committed apps/client/package.json
+      # cannot declare this overlay - the open-core repo carries no trace of it. That
+      # leaves the overlay hydrated as a workspace member but NOT linked into
+      # apps/client/node_modules, and pnpm only links a workspace package where it is
+      # declared. Every run of this workflow has been in that state since it was written.
+      #
+      # It went unnoticed because the absent-form glue still lets the overlay's own
+      # package typecheck. Then Bike4Mind/bike4mind#1014 (2026-07-31) made the host's
+      # codegen exit 1 on exactly that state when CI=true, on the reasoning that an
+      # unlinked overlay ships with its features silently un-wired. True of the deploy
+      # pipeline, which declares these deps before it installs and so is never in that
+      # state. Not true here, where unlinked was the standing condition - so every
+      # overlay on this template died in postinstall before a single check ran.
+      #
+      # Declaring the dependency is the better of the two fixes codegen's own message
+      # names: pnpm creates the link during install, so it exists before postinstall
+      # runs. A symlink after the fact would mean --ignore-scripts plus a hand-run
+      # codegen. The host checkout is thrown away at the end of the job.
+      #
+      # This makes the run MORE faithful, not less. Before it, the glue emitted the
+      # absent form, so everything below was typechecking a workspace where this
+      # overlay's routes, nav, API stubs and LLM tools were not wired at all.
+      - name: Link overlay into apps/client
+        env:
+          OVERLAY_PKG: '@bike4mind/premium-${{ inputs.overlay_name }}'
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const path = "apps/client/package.json";
+            const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+            const name = process.env.OVERLAY_PKG;
+            if (!pkg.dependencies) {
+              console.error("::error::" + path + " has no dependencies block; the host layout changed");
+              process.exit(1);
+            }
+            if (pkg.dependencies[name]) {
+              console.error("::error::" + path + " already declares " + name + ", so the host is no longer open-core about this overlay and this step is wrong");
+              process.exit(1);
+            }
+            pkg.dependencies[name] = "workspace:*";
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+            console.log("linked " + name + " into apps/client dependencies");
+          '
+
+      # --no-frozen-lockfile: the host gitignores its overlays, so its committed
+      # lockfile carries no entry for this package. The link step above is a second
+      # thing to reconcile, for the same reason.
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile --recursive
+
+      # Proves the link step took. Codegen emits a bare-specifier import for an overlay
+      # only when that overlay resolves from apps/client, so an absent-form warning here
+      # means the link silently did not happen and everything below is testing the
+      # un-wired workspace again.
+      - name: Verify the overlay was composed in
+        env:
+          OVERLAY_PKG: '@bike4mind/premium-${{ inputs.overlay_name }}'
+        run: |
+          set -euo pipefail
+          if [ ! -f "node_modules/${OVERLAY_PKG}/package.json" ] \
+            && [ ! -f "apps/client/node_modules/${OVERLAY_PKG}/package.json" ]; then
+            echo "::error::${OVERLAY_PKG} is not resolvable from apps/client after install, so the host codegen emitted the ABSENT form and this run is not testing the composed workspace. Check the Link step above."
+            exit 1
+          fi
+          echo "${OVERLAY_PKG} is linked; codegen emitted the composed form."
 
       - name: Build core packages
         run: pnpm core:build
