@@ -1,0 +1,4 @@
+# typescript is installed here by CI (and locally) purely to run the unit tests. The action
+# itself borrows the host tree's copy and installs nothing.
+node_modules/
+package-lock.json
