@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { collectSpecifiers, packageNameOf, isAllowlisted } from './lib.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { collectSpecifiers, packageNameOf, isAllowlisted, scanOverlay } from './lib.mjs';
 
 const ts = createRequire(import.meta.url)('typescript');
 const collect = (src) => collectSpecifiers(ts, src, 'sample.tsx');
@@ -154,4 +157,136 @@ test('lookalikes are not allowlisted', () => {
 test('extraAllowlist matches exactly', () => {
   assert.equal(isAllowlisted('weird-pkg', ['weird-pkg']), true);
   assert.equal(isAllowlisted('weird-pkg/sub', ['weird-pkg']), false);
+});
+
+// Builds a throwaway host+overlay pair. `files` maps overlay-relative paths to contents.
+function fixture({ overlayPkg, hostPkg, files }) {
+  const root = mkdtempSync(join(tmpdir(), 'cod-'));
+  const overlayRoot = join(root, 'packages', 'premium', 'sample');
+  mkdirSync(overlayRoot, { recursive: true });
+  writeFileSync(join(root, 'package.json'), JSON.stringify(hostPkg));
+  writeFileSync(join(overlayRoot, 'package.json'), JSON.stringify(overlayPkg));
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = join(overlayRoot, rel);
+    mkdirSync(join(abs, '..'), { recursive: true });
+    writeFileSync(abs, content);
+  }
+  return { hostRoot: root, overlayRoot };
+}
+
+const HOST = { name: 'host', dependencies: { sst: '4.14.1' }, devDependencies: { '@types/aws-lambda': '8.10.162' } };
+const scan = (f) => scanOverlay(ts, { ...f, extraAllowlist: [] });
+
+test('an undeclared value import is an error', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: {
+      'src/spa/Report.tsx': `import { Link } from '@tanstack/react-router';\nexport const a = Link;`,
+    },
+  });
+  const r = scan(f);
+  assert.equal(r.errors.length, 1);
+  assert.equal(r.errors[0].name, '@tanstack/react-router');
+  assert.equal(r.errors[0].file, 'src/spa/Report.tsx');
+  assert.equal(r.errors[0].line, 1);
+});
+
+test('declaring it in the overlay manifest clears the error, in any dependency block', () => {
+  for (const block of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+    const f = fixture({
+      hostPkg: HOST,
+      overlayPkg: { name: '@bike4mind/premium-sample', [block]: { '@tanstack/react-router': '^1.170.15' } },
+      files: { 'src/spa/Report.tsx': `import { Link } from '@tanstack/react-router';\nexport const a = Link;` },
+    });
+    assert.equal(scan(f).errors.length, 0, block);
+  }
+});
+
+test('a specifier declared only in the host root is a note, not an error', () => {
+  // How `sst` resolves for b4m-optihashi: the walk from packages/premium/<name> reaches the
+  // host root node_modules.
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: { 'src/server/cron.ts': `import { Resource } from 'sst';\nexport const r = Resource;` },
+  });
+  const r = scan(f);
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.notes.length, 1);
+  assert.match(r.notes[0].reason, /host root/);
+});
+
+test('a type-only import of @types/<name> from the host root is a note', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: {
+      'src/server/h.ts': `import { SQSEvent } from 'aws-lambda';\nexport function f(e: SQSEvent): void {}`,
+    },
+  });
+  const r = scan(f);
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.notes.length, 1);
+});
+
+test('a type-only import that resolves nowhere is a note, never an error', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: {
+      'src/api/run.ts': `import { Request } from 'express';\nexport function h(r: Request): void {}`,
+    },
+  });
+  const r = scan(f);
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.notes.length, 1);
+  assert.match(r.notes[0].reason, /type-only/);
+});
+
+test('the overlay may import itself by its own name', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: {
+      'src/spa/routes.ts': `import { x } from '@bike4mind/premium-sample/llm-tools';\nexport const y = x;`,
+    },
+  });
+  assert.equal(scan(f).errors.length, 0);
+});
+
+test('a nested directory with its own package.json is skipped', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: {
+      'site/package.json': JSON.stringify({ name: 'sample-site' }),
+      'site/src/main.ts': `import { createApp } from 'vue';\nexport const a = createApp;`,
+      'src/index.ts': `export const ok = 1;`,
+    },
+  });
+  const r = scan(f);
+  assert.equal(r.errors.length, 0);
+  assert.deepEqual(r.skippedNested, ['site']);
+});
+
+test('node_modules is never scanned', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: {
+      'node_modules/junk/index.ts': `import { z } from 'totally-undeclared';\nexport const a = z;`,
+      'src/index.ts': `export const ok = 1;`,
+    },
+  });
+  assert.equal(scan(f).errors.length, 0);
+});
+
+test('scanned counts only the files it actually parsed', () => {
+  const f = fixture({
+    hostPkg: HOST,
+    overlayPkg: { name: '@bike4mind/premium-sample' },
+    files: { 'src/a.ts': `export const a = 1;`, 'src/b.tsx': `export const b = 2;`, 'README.md': `# no` },
+  });
+  assert.equal(scan(f).scanned, 2);
 });

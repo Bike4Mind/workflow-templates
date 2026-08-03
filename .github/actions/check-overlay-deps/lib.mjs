@@ -3,7 +3,9 @@
 // The TypeScript module is INJECTED rather than imported so the action can borrow the host
 // tree's copy (adding no dependency to any consumer) while tests supply their own.
 
-import { builtinModules } from 'node:module';
+import { builtinModules, createRequire } from 'node:module';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, relative } from 'node:path';
 
 // TypeScript uses ExpressionWithTypeArguments for BOTH `class C extends Base`, where Base is a
 // real runtime value that builds the prototype chain, and `class C implements I` /
@@ -124,4 +126,103 @@ export function packageNameOf(spec) {
 export function isAllowlisted(spec, extraAllowlist) {
   if (extraAllowlist.includes(spec)) return true;
   return BUNDLER_ALIASED.some((r) => r.test(spec)) || HOST_ALIASES.some((r) => r.test(spec));
+}
+
+const SOURCE_EXT = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs']);
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage']);
+
+// A nested directory with its own package.json is a separate package carrying its own
+// declarations, so measuring it against the overlay's manifest asks the wrong question.
+// Discovered rather than hardcoded: today this finds bob/site, tavern/cc-bridge,
+// optihashi/engine and optihashi/engine-container.
+function nestedPackageRoots(dir, acc = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || SKIP_DIRS.has(entry.name)) continue;
+    const child = join(dir, entry.name);
+    try {
+      statSync(join(child, 'package.json'));
+      acc.push(child);
+      continue; // it owns everything below it
+    } catch {
+      nestedPackageRoots(child, acc);
+    }
+  }
+  return acc;
+}
+
+function sourceFiles(dir, nested, acc = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name) || nested.includes(p)) continue;
+      sourceFiles(p, nested, acc);
+    } else if (SOURCE_EXT.has(entry.name.slice(entry.name.lastIndexOf('.')))) {
+      acc.push(p);
+    }
+  }
+  return acc;
+}
+
+const manifestNames = (pkg) => [
+  ...Object.keys(pkg.dependencies ?? {}),
+  ...Object.keys(pkg.devDependencies ?? {}),
+  ...Object.keys(pkg.peerDependencies ?? {}),
+  ...Object.keys(pkg.optionalDependencies ?? {}),
+];
+
+// Real resolution from the importing file's own directory. Only meaningful once node_modules
+// exists; additive, never the sole authority, so the gate still works before install.
+function resolvesFrom(fileAbsPath, spec) {
+  try {
+    createRequire(fileAbsPath).resolve(spec);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function scanOverlay(ts, { overlayRoot, hostRoot, extraAllowlist = [] }) {
+  const overlayPkg = JSON.parse(readFileSync(join(overlayRoot, 'package.json'), 'utf8'));
+  const hostPkg = JSON.parse(readFileSync(join(hostRoot, 'package.json'), 'utf8'));
+  const overlayDeclared = new Set([...manifestNames(overlayPkg), overlayPkg.name]);
+  const hostRootDeclared = new Set(manifestNames(hostPkg));
+
+  const nested = nestedPackageRoots(overlayRoot);
+  const files = sourceFiles(overlayRoot, nested);
+  const errors = [];
+  const notes = [];
+
+  for (const file of files) {
+    const rel = relative(overlayRoot, file);
+    const specs = collectSpecifiers(ts, readFileSync(file, 'utf8'), file);
+    for (const { spec, typeOnly, line } of specs) {
+      if (isAllowlisted(spec, extraAllowlist)) continue;
+      const name = packageNameOf(spec);
+      if (!name) continue;
+      if (overlayDeclared.has(name)) continue;
+
+      const hit = { file: rel, line, spec, name };
+      if (hostRootDeclared.has(name) || (typeOnly && hostRootDeclared.has(`@types/${name}`))) {
+        notes.push({ ...hit, reason: `satisfied by the host root${typeOnly ? ' (type-only)' : ''}` });
+        continue;
+      }
+      if (resolvesFrom(file, spec)) {
+        notes.push({ ...hit, reason: 'resolves from the installed tree' });
+        continue;
+      }
+      if (typeOnly) {
+        notes.push({ ...hit, reason: 'type-only and resolves nowhere: typecheck debt, cannot break the build' });
+        continue;
+      }
+      errors.push(hit);
+    }
+  }
+
+  return {
+    overlayName: overlayPkg.name,
+    scanned: files.length,
+    skippedNested: nested.map((n) => relative(overlayRoot, n)),
+    errors,
+    notes,
+  };
 }
