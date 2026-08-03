@@ -1,0 +1,27 @@
+name: 'Check overlay dependency declarations'
+description: >-
+  Fails when a premium overlay imports a package as a value that resolves neither from the
+  overlay nor from the host root. Must run AFTER pnpm install: it borrows the host tree's
+  typescript rather than installing its own.
+inputs:
+  overlay_path:
+    description: 'Path to the overlay root, e.g. packages/premium/bob'
+    required: true
+  host_root:
+    description: 'Path to the host monorepo root'
+    required: false
+    default: '.'
+  extra_allowlist:
+    description: 'Space-separated specifiers to exempt. Escape hatch; expected to stay empty.'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - name: Check overlay dependency declarations
+      shell: bash
+      run: |
+        node "${{ github.action_path }}/cli.mjs" \
+          "${{ inputs.overlay_path }}" \
+          "${{ inputs.host_root }}" \
+          "${{ inputs.extra_allowlist }}"
