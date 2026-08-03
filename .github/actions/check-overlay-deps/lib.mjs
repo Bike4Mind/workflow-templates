@@ -3,6 +3,8 @@
 // The TypeScript module is INJECTED rather than imported so the action can borrow the host
 // tree's copy (adding no dependency to any consumer) while tests supply their own.
 
+import { builtinModules } from 'node:module';
+
 // TypeScript uses ExpressionWithTypeArguments for BOTH `class C extends Base`, where Base is a
 // real runtime value that builds the prototype chain, and `class C implements I` /
 // `interface I extends J`, which are fully erased. ts.isTypeNode() reports "type" for all
@@ -96,4 +98,30 @@ export function collectSpecifiers(ts, sourceText, fileName) {
 
   visit(sf);
   return out;
+}
+
+// Specifiers a bundler rewrites before resolution ever happens. See the test for why this
+// list is load-bearing rather than a convenience.
+const BUNDLER_ALIASED = [
+  /^react$/,
+  /^react-dom(\/.*)?$/,
+  /^react\/jsx-runtime$/,
+  /^react\/jsx-dev-runtime$/,
+  /^next(\/.*)?$/,
+];
+
+// Host tsconfig `paths` entries. Not packages at all.
+const HOST_ALIASES = [/^@server(\/.*)?$/, /^@client(\/.*)?$/];
+
+export function packageNameOf(spec) {
+  if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('node:')) return null;
+  const parts = spec.split('/');
+  const name = spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
+  if (builtinModules.includes(name)) return null;
+  return name;
+}
+
+export function isAllowlisted(spec, extraAllowlist) {
+  if (extraAllowlist.includes(spec)) return true;
+  return BUNDLER_ALIASED.some((r) => r.test(spec)) || HOST_ALIASES.some((r) => r.test(spec));
 }

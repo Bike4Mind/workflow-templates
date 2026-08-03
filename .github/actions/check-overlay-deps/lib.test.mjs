@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { collectSpecifiers } from './lib.mjs';
+import { collectSpecifiers, packageNameOf, isAllowlisted } from './lib.mjs';
 
 const ts = createRequire(import.meta.url)('typescript');
 const collect = (src) => collectSpecifiers(ts, src, 'sample.tsx');
@@ -112,4 +112,46 @@ test('extends with type arguments is a value import, and the type argument is no
   ].join('\n');
   assert.equal(find(src, 'pkg').typeOnly, false);
   assert.equal(find(src, 'types-pkg').typeOnly, true);
+});
+
+test('packageNameOf extracts scoped and unscoped names', () => {
+  assert.equal(packageNameOf('@tanstack/react-router'), '@tanstack/react-router');
+  assert.equal(packageNameOf('@tanstack/react-query/build/modern'), '@tanstack/react-query');
+  assert.equal(packageNameOf('robots-parser'), 'robots-parser');
+  assert.equal(packageNameOf('lodash/merge'), 'lodash');
+});
+
+test('packageNameOf returns null for non-package specifiers', () => {
+  assert.equal(packageNameOf('./reportView'), null);
+  assert.equal(packageNameOf('../llm-tools/panelRead'), null);
+  assert.equal(packageNameOf('/abs/path'), null);
+  assert.equal(packageNameOf('node:fs'), null);
+  assert.equal(packageNameOf('fs'), null);
+  assert.equal(packageNameOf('path'), null);
+});
+
+test('bundler-aliased specifiers are allowlisted', () => {
+  // react is undeclared in every overlay and lives only in node_modules/.pnpm/node_modules,
+  // which is NOT on the resolution walk from packages/premium/<name>. It works purely because
+  // Next aliases it. Omitting these fails all six overlays on day one.
+  for (const s of ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime', 'react/jsx-dev-runtime', 'next', 'next/router']) {
+    assert.equal(isAllowlisted(s, []), true, s);
+  }
+});
+
+test('host tsconfig path aliases are allowlisted', () => {
+  assert.equal(isAllowlisted('@server/middlewares/baseApi', []), true);
+  assert.equal(isAllowlisted('@client/components/Foo', []), true);
+});
+
+test('lookalikes are not allowlisted', () => {
+  assert.equal(isAllowlisted('react-router', []), false);
+  assert.equal(isAllowlisted('@tanstack/react-router', []), false);
+  assert.equal(isAllowlisted('nextjs-toast', []), false);
+  assert.equal(isAllowlisted('@servers/foo', []), false);
+});
+
+test('extraAllowlist matches exactly', () => {
+  assert.equal(isAllowlisted('weird-pkg', ['weird-pkg']), true);
+  assert.equal(isAllowlisted('weird-pkg/sub', ['weird-pkg']), false);
 });
