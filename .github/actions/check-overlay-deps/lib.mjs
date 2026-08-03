@@ -3,6 +3,20 @@
 // The TypeScript module is INJECTED rather than imported so the action can borrow the host
 // tree's copy (adding no dependency to any consumer) while tests supply their own.
 
+// TypeScript uses ExpressionWithTypeArguments for BOTH `class C extends Base`, where Base is a
+// real runtime value that builds the prototype chain, and `class C implements I` /
+// `interface I extends J`, which are fully erased. ts.isTypeNode() reports "type" for all
+// three, so without this the base class of every `extends` looks erasable and an undeclared
+// base-class package would pass the gate silently.
+function isValueHeritage(ts, node) {
+  if (!ts.isExpressionWithTypeArguments(node)) return false;
+  const clause = node.parent;
+  if (!clause || !ts.isHeritageClause(clause)) return false;
+  if (clause.token !== ts.SyntaxKind.ExtendsKeyword) return false;
+  const decl = clause.parent;
+  return !!decl && (ts.isClassDeclaration(decl) || ts.isClassExpression(decl));
+}
+
 // Every identifier appearing in a VALUE position in this file. An import binding absent from
 // this set is erased by SWC/tsc before the bundler resolves anything, which is why
 // `import { Request, Response } from 'express'` never breaks a build even though `express`
@@ -14,7 +28,7 @@ function valuePositionIdentifiers(ts, sf) {
   const walk = (node, inType) => {
     const isTypeContext =
       inType ||
-      ts.isTypeNode(node) ||
+      (ts.isTypeNode(node) && !isValueHeritage(ts, node)) ||
       ts.isTypeAliasDeclaration(node) ||
       ts.isInterfaceDeclaration(node) ||
       ts.isTypeParameterDeclaration(node);

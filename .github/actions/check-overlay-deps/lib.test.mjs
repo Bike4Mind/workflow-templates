@@ -86,3 +86,30 @@ test('line numbers are 1-indexed and point at the import', () => {
   const src = [`// header`, ``, `import { Link } from 'pkg';`, `export const a = Link;`].join('\n');
   assert.equal(find(src, 'pkg').line, 3);
 });
+
+test('a class extending an imported base is a value import', () => {
+  // TS uses one node kind for `extends` and `implements`; the base class is a real runtime
+  // value, so an undeclared base-class package must be reported.
+  const src = `import { Base } from 'pkg';\nexport class Foo extends Base {}`;
+  assert.equal(find(src, 'pkg').typeOnly, false);
+});
+
+test('a class implementing an imported interface stays type-only', () => {
+  const src = `import { IBase } from 'pkg';\nexport class Foo implements IBase {}`;
+  assert.equal(find(src, 'pkg').typeOnly, true);
+});
+
+test('an interface extending an imported interface stays type-only', () => {
+  const src = `import { IBase } from 'pkg';\nexport interface Foo extends IBase {}`;
+  assert.equal(find(src, 'pkg').typeOnly, true);
+});
+
+test('extends with type arguments is a value import, and the type argument is not a value use', () => {
+  const src = [
+    `import { Base } from 'pkg';`,
+    `import { Row } from 'types-pkg';`,
+    `export class Foo extends Base<Row> {}`,
+  ].join('\n');
+  assert.equal(find(src, 'pkg').typeOnly, false);
+  assert.equal(find(src, 'types-pkg').typeOnly, true);
+});
