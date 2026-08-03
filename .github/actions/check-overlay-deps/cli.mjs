@@ -35,7 +35,11 @@ for (const n of r.notes) console.log(`  note  ${n.file}:${n.line}  '${n.spec}'  
 
 for (const e of r.errors) {
   console.log(
-    `::error file=${overlayPath}/${e.file},line=${e.line}::${r.overlayName} imports '${e.spec}' as a value, ` +
+    // Overlay-root-relative, NOT host-relative. GitHub anchors this to the tree of the repo whose
+    // workflow produced the check run, which in overlay CI is the overlay repo itself - there is no
+    // packages/premium/<name>/ prefix inside that tree. The overlay name is already in the message
+    // body, and the deploy backstop prints its own `== <name> ==` header, so no context is lost.
+    `::error file=${e.file},line=${e.line}::${r.overlayName} imports '${e.spec}' as a value, ` +
       `but '${e.name}' resolves neither from this overlay nor from the host root. The bundler will fail on ` +
       `this once the overlay is hydrated. Declare '${e.name}' in ${r.overlayName}'s package.json ` +
       `(peerDependencies + devDependencies if the host already owns the copy).`
