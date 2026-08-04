@@ -19,8 +19,10 @@ runs:
     - name: Validate phase
       if: ${{ inputs.phase != 'link' && inputs.phase != 'verify' }}
       shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
       run: |
-        echo "::error::overlay-link: phase must be 'link' or 'verify', got '${{ inputs.phase }}'"
+        echo "::error::overlay-link: phase must be 'link' or 'verify', got '${PHASE}'"
         exit 1
 
     - name: Link overlay into apps/client
