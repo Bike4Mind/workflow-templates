@@ -2,7 +2,9 @@ name: scripts-ci
 
 on:
   pull_request:
-    paths: ['scripts/**']
+    paths:
+      - 'scripts/**'
+      - '.github/actions/check-overlay-deps/**'
 
 permissions:
   contents: read
@@ -15,3 +17,21 @@ jobs:
         uses: actions/checkout@v6
       - name: Run compute-next-semver tests
         run: bash scripts/tests/compute-next-semver.test.sh
+
+  test-check-overlay-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      # typescript is a TEST-ONLY dependency here. The action itself never installs it -
+      # it borrows the host tree's copy, so consumers gain no dependency.
+      - name: Install the test-only compiler
+        working-directory: .github/actions/check-overlay-deps
+        run: npm install --no-save --no-audit --no-fund typescript@5.9.3
+      - name: Run unit tests
+        working-directory: .github/actions/check-overlay-deps
+        run: node --test lib.test.mjs

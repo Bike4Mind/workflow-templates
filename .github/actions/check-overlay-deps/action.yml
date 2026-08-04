@@ -1,0 +1,36 @@
+name: 'Check overlay dependency declarations'
+description: >-
+  Fails when a premium overlay imports a package as a value that resolves neither from the
+  overlay nor from the host root. Must run AFTER pnpm install: it borrows the host tree's
+  typescript rather than installing its own.
+inputs:
+  overlay_path:
+    description: 'Path to the overlay root, e.g. packages/premium/bob'
+    required: true
+  host_root:
+    description: 'Path to the host monorepo root'
+    required: false
+    default: '.'
+  extra_allowlist:
+    description: 'Space-separated specifiers to exempt. Escape hatch; expected to stay empty.'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    # Inputs go through `env:` rather than being interpolated into `run:`. They are
+    # workflow-authored and therefore trusted today, but this action is public and consumed by
+    # private repos, so the interpolation form is worth not shipping at all - a future caller
+    # passing a value derived from anything untrusted would inject shell. `github.action_path`
+    # is runner-provided, not caller-provided, so it stays interpolated.
+    - name: Check overlay dependency declarations
+      shell: bash
+      env:
+        OVERLAY_PATH: ${{ inputs.overlay_path }}
+        HOST_ROOT: ${{ inputs.host_root }}
+        EXTRA_ALLOWLIST: ${{ inputs.extra_allowlist }}
+      run: |
+        node "${{ github.action_path }}/cli.mjs" \
+          "$OVERLAY_PATH" \
+          "$HOST_ROOT" \
+          "$EXTRA_ALLOWLIST"
