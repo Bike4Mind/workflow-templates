@@ -18,10 +18,19 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # Inputs go through `env:` rather than being interpolated into `run:`. They are
+    # workflow-authored and therefore trusted today, but this action is public and consumed by
+    # private repos, so the interpolation form is worth not shipping at all - a future caller
+    # passing a value derived from anything untrusted would inject shell. `github.action_path`
+    # is runner-provided, not caller-provided, so it stays interpolated.
     - name: Check overlay dependency declarations
       shell: bash
+      env:
+        OVERLAY_PATH: ${{ inputs.overlay_path }}
+        HOST_ROOT: ${{ inputs.host_root }}
+        EXTRA_ALLOWLIST: ${{ inputs.extra_allowlist }}
       run: |
         node "${{ github.action_path }}/cli.mjs" \
-          "${{ inputs.overlay_path }}" \
-          "${{ inputs.host_root }}" \
-          "${{ inputs.extra_allowlist }}"
+          "$OVERLAY_PATH" \
+          "$HOST_ROOT" \
+          "$EXTRA_ALLOWLIST"
