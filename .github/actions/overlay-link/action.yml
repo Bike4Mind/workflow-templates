@@ -1,0 +1,65 @@
+name: 'Link premium overlay into apps/client'
+description: >-
+  Wires a hydrated premium overlay into the host's apps/client so pnpm links it before the
+  host's premium codegen runs, then verifies the link took. Bike4Mind/bike4mind gitignores
+  packages/premium/*, so apps/client/package.json cannot declare the overlay and pnpm never
+  links it on its own; since bike4mind#1014 the host codegen exit 1s on that un-linked state
+  under CI. Call phase=link BEFORE `pnpm install` and phase=verify AFTER it.
+inputs:
+  overlay_name:
+    description: 'Short overlay name, e.g. bob. Expands to @bike4mind/premium-<name>.'
+    required: true
+  phase:
+    description: "link (run before pnpm install) or verify (run after pnpm install)"
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    # A typo'd phase would make both steps below no-ops, silently un-wiring the run - fail loudly.
+    - name: Validate phase
+      if: ${{ inputs.phase != 'link' && inputs.phase != 'verify' }}
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+      run: |
+        echo "::error::overlay-link: phase must be 'link' or 'verify', got '${PHASE}'"
+        exit 1
+
+    - name: Link overlay into apps/client
+      if: ${{ inputs.phase == 'link' }}
+      shell: bash
+      env:
+        OVERLAY_PKG: '@bike4mind/premium-${{ inputs.overlay_name }}'
+      run: |
+        set -euo pipefail
+        node -e '
+          const fs = require("fs");
+          const path = "apps/client/package.json";
+          const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+          const name = process.env.OVERLAY_PKG;
+          if (!pkg.dependencies) {
+            console.error("::error::" + path + " has no dependencies block; the host layout changed");
+            process.exit(1);
+          }
+          if (pkg.dependencies[name]) {
+            console.error("::error::" + path + " already declares " + name + ", so the host is no longer open-core about this overlay and this step is wrong");
+            process.exit(1);
+          }
+          pkg.dependencies[name] = "workspace:*";
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+          console.log("linked " + name + " into apps/client dependencies");
+        '
+
+    - name: Verify the overlay was composed in
+      if: ${{ inputs.phase == 'verify' }}
+      shell: bash
+      env:
+        OVERLAY_PKG: '@bike4mind/premium-${{ inputs.overlay_name }}'
+      run: |
+        set -euo pipefail
+        if [ ! -f "node_modules/${OVERLAY_PKG}/package.json" ] \
+          && [ ! -f "apps/client/node_modules/${OVERLAY_PKG}/package.json" ]; then
+          echo "::error::${OVERLAY_PKG} is not resolvable from apps/client after install, so the host codegen emitted the ABSENT form and this run is not testing the composed workspace. Check the Link step above."
+          exit 1
+        fi
+        echo "${OVERLAY_PKG} is linked; codegen emitted the composed form."
