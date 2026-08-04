@@ -205,6 +205,30 @@ jobs:
           fi
           echo "${OVERLAY_PKG} is linked; codegen emitted the composed form."
 
+      # Placed here deliberately: post-install, so the host tree's typescript exists and real
+      # resolution is meaningful, but before the core build, so it fails in seconds rather than
+      # minutes. It needs neither built core packages nor generated SST types.
+      #
+      # This closes the gap that let b4m-bob#92 merge green on 2026-08-03. That PR added value
+      # imports of @tanstack/react-router and @tanstack/react-query to src/spa/BobReport.tsx,
+      # which the overlay's own tsconfig EXCLUDES, so `Typecheck` below never saw the file and
+      # `glue_consumers` only covers @bike4mind/scripts. CI passed; every open PR's preview then
+      # failed on `Module not found`.
+      #
+      # On the @main pin: a nested `uses:` is resolved independently of the ref a caller pinned
+      # THIS workflow to, so an overlay pinning overlay-ci.yml@<sha> would still get the action
+      # from main. That is accepted rather than fixed. A repo-relative `./.github/actions/...`
+      # path cannot work - the job's workspace holds the host monorepo plus the overlay, never a
+      # checkout of workflow-templates - and the only alternative is a second checkout of this
+      # repo at a controlled ref, which moves the pin without removing the independence. All five
+      # consumers track @main today (see the caller shim in the header), so both layers float
+      # together; revisit if any consumer starts pinning.
+      - name: Check overlay dependency declarations
+        uses: Bike4Mind/workflow-templates/.github/actions/check-overlay-deps@main
+        with:
+          overlay_path: packages/premium/${{ inputs.overlay_name }}
+          host_root: .
+
       - name: Build core packages
         run: pnpm core:build
 
