@@ -149,9 +149,30 @@ else
 fi
 
 # --- Assertion 3: every domain rule is reachable ------------------------------
+#
+# Scoped to the rules the config actually declares. A repository that brings its own
+# .gitleaks.toml names its rules differently - bike4mind uses bike4mind-slack-webhook
+# where the org default uses b4m-slack-webhook - so asserting ids it never defines
+# reports a scanning outage that is not happening.
+#
+# That is not hypothetical: it failed every nightly sweep of bike4mind, and because
+# the sweep runs the scan with continue-on-error the job still reported green. Only
+# the "did not scan" line in the tracking issue caught it.
+#
+# Deriving the set from the config rather than from the file path keeps a config that
+# DOES declare these rules honest even when it lives somewhere else, which is what the
+# test suite relies on to prove this assertion can still fail.
+ASSERTED=0
+SKIPPED=0
+
 assert_rule_reachable() {
   rule_id=$1
   canary=$2
+  if ! grep -q "id *= *\"$rule_id\"" "$CONFIG"; then
+    SKIPPED=$((SKIPPED + 1))
+    return
+  fi
+  ASSERTED=$((ASSERTED + 1))
   canary_file="$TEMP_DIR/domain-$rule_id.ts"
   report_file="$TEMP_DIR/domain-$rule_id.json"
   printf '%s\n' "$canary" > "$canary_file"
@@ -196,6 +217,14 @@ assert_rule_reachable b4m-gemini-key \
   "const key = 'AIza$(rand_str 'A-Za-z0-9' 35)';"
 assert_rule_reachable b4m-slack-webhook \
   "const hook = 'https://hooks.slack.com/services/T$(rand_str 'A-Za-z0-9' 9)/B$(rand_str 'A-Za-z0-9' 9)/$(rand_str 'A-Za-z0-9' 24)';"
+
+if [ "$SKIPPED" -gt 0 ]; then
+  echo "note: $SKIPPED rule assertion(s) skipped - this config does not declare them."
+  if [ "$ASSERTED" -eq 0 ]; then
+    echo "      No per-rule reachability was asserted. Builtin-rule and allowlist"
+    echo "      assertions above are config-agnostic and did run."
+  fi
+fi
 
 if [ "$FAILED" -ne 0 ]; then
   echo ""
