@@ -96,6 +96,20 @@ sed 's|mongodb(?:|zzznomatch(?:|' "$GOOD_CONFIG" > "$TEMP_DIR/dead-rule.toml"
 expect_fail "config with an unreachable domain rule is rejected" \
   "$TEMP_DIR/dead-rule.toml" "b4m-mongodb-uri matched nothing"
 
+# --- A caller's own config runs the generic assertions only -------------------
+# A repository that brings its own .gitleaks.toml names its rules differently, so the
+# per-rule canaries cannot apply. It must still be held to the config-agnostic
+# assertions rather than skipped wholesale. Renaming every rule simulates that.
+sed 's/^id = "b4m-/id = "custom-/' "$GOOD_CONFIG" > "$TEMP_DIR/custom-rule-ids.toml"
+expect_pass "a config with foreign rule ids passes the generic assertions" \
+  "$TEMP_DIR/custom-rule-ids.toml"
+
+# ...but is still rejected when a generic assertion genuinely fails, so the escape
+# hatch above cannot be used to smuggle a broken config through.
+sed '/^\[extend\]$/,$d' "$TEMP_DIR/custom-rule-ids.toml" > "$TEMP_DIR/custom-broken.toml"
+expect_fail "a foreign-id config with builtins disabled is still rejected" \
+  "$TEMP_DIR/custom-broken.toml" "builtin rules are not active"
+
 # --- A missing config is an error, not a skip ---------------------------------
 expect_fail "a missing config file is rejected" \
   "$TEMP_DIR/does-not-exist.toml" "config not found"
