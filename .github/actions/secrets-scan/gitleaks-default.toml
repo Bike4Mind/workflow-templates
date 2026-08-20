@@ -1,0 +1,160 @@
+# Org-wide default gitleaks configuration for Bike4Mind repositories.
+#
+# Used by the `secrets-scan.yml` reusable workflow when the calling repository has
+# no `.gitleaks.toml` of its own. A repo that needs different rules commits its own
+# config and passes `config-path`; it does not edit this file.
+#
+# Pinned CLI: gitleaks 8.30.1 (see secrets-scan.yml). Two syntax hazards that have
+# already cost us a silent scanning outage in bike4mind, kept here as warnings:
+#
+#   1. Keep the SINGULAR [allowlist] table. The [[allowlists]] array form loads
+#      without error on some versions and is silently ignored by others, which drops
+#      every exclusion below it with no diagnostic.
+#   2. Keep `[extend] useDefault = true`. A bare `[useBuiltinRules]` table is not
+#      gitleaks syntax - it parses as an empty table and leaves every builtin rule
+#      disabled, so the scan passes while detecting almost nothing.
+#
+# `scripts/gitleaks-config-selftest.sh` asserts both of these against generated
+# canaries. Run it after any edit here.
+
+title = "Bike4Mind org default"
+
+[allowlist]
+description = "Paths and literals that are never live credentials"
+paths = [
+  # Generated and compiled output
+  ".*\\.min\\.js$",
+  ".*\\.chunk\\.js$",
+  ".*\\.bundle\\.js$",
+  ".*/build/.*",
+  ".*/dist/.*",
+  ".*/node_modules/.*",
+  ".*/\\.next/.*",
+  # Lockfiles - long high-entropy integrity hashes, never credentials
+  "pnpm-lock\\.yaml$",
+  "package-lock\\.json$",
+  "yarn\\.lock$",
+  # Test fixtures and tests: strings here are by definition not live credentials
+  ".*/__fixtures__/.*",
+  ".*/__mocks__/.*",
+  ".*/__tests__/.*",
+  ".*\\.test\\.[tj]sx?$",
+  ".*\\.spec\\.[tj]sx?$",
+  # Documentation - placeholder strings are expected
+  ".*/docs/.*",
+  ".*README\\.md$",
+  # Example env files hold intentional placeholders
+  "\\.env\\.example$",
+  "\\.env\\..*\\.example$"
+]
+
+regexes = [
+  # AWS canonical documentation key - never a live credential
+  "AKIAIOSFODNN7EXAMPLE",
+  # Slack documentation sample workspace / channel / token shapes
+  "T00000000",
+  "B00000000",
+  "XXXXXXXXXXXXXXXXXXXXXXXXX",
+  # jwt.io sample token prefix
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJzdWIiOiIxMjM0NTY3ODkwIi",
+  # Generic placeholder shapes
+  "(?i)your[-_](api[-_])?(token|key|secret)",
+  "your[-_]secret[-_]here",
+  "insert[-_].*[-_]here",
+  "<your[-_]",
+  # Shell and template interpolation, not a literal value
+  "\\$\\{[A-Z_]+\\}",
+  "%[A-Z_]+%"
+]
+
+# --- Domain rules -------------------------------------------------------------
+# Capture groups stay NON-capturing unless a secretGroup points at them. gitleaks
+# applies the `entropy` floor to capture group 1 regardless of what secretGroup
+# says, so a rule whose group 1 is a short literal alternation (`(sk|pk)`,
+# `(\+srv)`) scores that literal and silently never reports.
+
+[[rules]]
+id = "b4m-mongodb-uri"
+description = "MongoDB connection string"
+regex = "mongodb(?:\\+srv)?://[^\\s'\"]*"
+tags = ["mongodb", "connection-string"]
+
+[rules.allowlist]
+regexes = [
+  # Bare scheme with no host or credentials: startsWith() guards and prose
+  "mongodb(\\+srv)?://\\.?$",
+  "mongodb(\\+srv)?://(localhost|127\\.0\\.0\\.1)"
+]
+
+[[rules]]
+id = "b4m-jwt-secret"
+description = "JWT signing secret"
+# gitleaks compiles rule regexes without the multiline flag, so `^` matches only the
+# start of the file. The [_.] alternative is what makes this match in practice.
+regex = "([_\\.]|^)JWT_SECRET[=:][\"']?([^\\s\"']+)[\"']?"
+tags = ["jwt", "auth"]
+secretGroup = 2
+entropy = 3.0
+
+[[rules]]
+id = "b4m-session-secret"
+description = "Session signing secret"
+regex = "([_\\.]|^)SESSION_SECRET[=:][\"']?([^\\s\"']+)[\"']?"
+tags = ["session", "auth"]
+secretGroup = 2
+entropy = 3.0
+
+[[rules]]
+id = "b4m-stripe-keys"
+description = "Stripe API key"
+regex = "(?:sk|pk|whsec)_(?:test|live)_[0-9a-zA-Z]{24,}"
+tags = ["stripe", "payment"]
+entropy = 3.0
+
+[[rules]]
+id = "b4m-anthropic-key"
+description = "Anthropic API key"
+regex = "sk-ant-[a-zA-Z0-9\\-_]{48,}"
+tags = ["anthropic", "ai"]
+secretGroup = 0
+entropy = 4.0
+
+[[rules]]
+id = "b4m-openai-key"
+description = "OpenAI API key"
+regex = "sk-(?:proj-)?[a-zA-Z0-9\\-_]{40,}"
+tags = ["openai", "ai"]
+secretGroup = 0
+entropy = 4.0
+
+[rules.allowlist]
+regexes = [
+  # Anthropic keys share the sk- prefix and have their own rule above
+  "sk-ant-"
+]
+
+[[rules]]
+id = "b4m-gemini-key"
+description = "Google Gemini API key"
+regex = "AIza[0-9A-Za-z\\-_]{35}"
+tags = ["google", "ai"]
+secretGroup = 0
+entropy = 3.5
+
+[[rules]]
+id = "b4m-slack-webhook"
+description = "Slack webhook URL"
+regex = "https://hooks\\.slack\\.com/services/T[a-zA-Z0-9]{8,10}/B[a-zA-Z0-9]{8,10}/[a-zA-Z0-9]{24}"
+tags = ["slack", "webhook"]
+secretGroup = 0
+entropy = 3.0
+
+# Builtin rules (aws-access-token, github-pat, gcp, private keys, ...) layer on top
+# of the domain rules above.
+#
+# generic-api-key stays disabled. It is a pure entropy heuristic with no credential
+# shape and fires on ordinary camelCase identifiers, which trains people to reach for
+# --no-verify - and that skips every other pre-commit guard too.
+[extend]
+useDefault = true
+disabledRules = ["generic-api-key"]

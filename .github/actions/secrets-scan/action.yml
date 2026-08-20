@@ -1,0 +1,211 @@
+name: Secrets scan
+description: >
+  Scan a repository for committed credentials with gitleaks and trufflehog. Replaces
+  GitHub Advanced Security Secret Protection, which bills per active committer.
+
+inputs:
+  scan-mode:
+    description: >
+      "diff" scans only the commits this PR adds (default). "history" scans the full
+      git history.
+
+      diff is the right default for a required status check: a repo with a
+      pre-existing finding anywhere in its history would otherwise fail every PR,
+      including ones that touch nothing related, and people would route around the
+      check rather than fix it. History is covered by the nightly org sweep instead.
+    required: false
+    default: diff
+  base-ref:
+    description: Base commit or ref for diff mode. Defaults to the PR base SHA.
+    required: false
+    default: ''
+  config-path:
+    description: >
+      gitleaks config to use. Defaults to the calling repository's .gitleaks.toml if
+      it has one, otherwise the org default bundled with this action.
+    required: false
+    default: ''
+  gitleaks-version:
+    description: gitleaks CLI version, pinned.
+    required: false
+    default: 8.30.1
+  trufflehog-version:
+    description: trufflehog CLI version, pinned.
+    required: false
+    default: 3.97.0
+  run-trufflehog:
+    description: >
+      Run trufflehog with credential verification. Unlike gitleaks pattern matching,
+      this calls the provider API to establish whether a found credential is live -
+      the capability GHAS charges for and which is disabled on our GHAS config today.
+    required: false
+    default: 'true'
+  fail-on-findings:
+    description: Exit non-zero when a secret is found. Set false to report only.
+    required: false
+    default: 'true'
+
+outputs:
+  gitleaks-findings:
+    description: Number of gitleaks findings.
+    value: ${{ steps.gitleaks.outputs.findings }}
+  trufflehog-verified:
+    description: Number of trufflehog findings whose credential verified as live.
+    value: ${{ steps.trufflehog.outputs.verified }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve configuration
+      id: cfg
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${{ inputs.config-path }}" ]; then
+          config="${{ inputs.config-path }}"
+          origin="input"
+        elif [ -f .gitleaks.toml ]; then
+          config=".gitleaks.toml"
+          origin="calling repository"
+        else
+          config="${{ github.action_path }}/gitleaks-default.toml"
+          origin="org default"
+        fi
+        if [ ! -f "$config" ]; then
+          echo "::error::gitleaks config not found: $config"
+          exit 1
+        fi
+        echo "config=$config" >> "$GITHUB_OUTPUT"
+        echo "Using gitleaks config from the $origin: $config"
+
+        base="${{ inputs.base-ref }}"
+        if [ -z "$base" ]; then
+          base="${{ github.event.pull_request.base.sha }}"
+        fi
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+
+    - name: Install gitleaks
+      shell: bash
+      env:
+        VERSION: ${{ inputs.gitleaks-version }}
+      run: |
+        set -euo pipefail
+        curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+          | sudo tar -xz -C /usr/local/bin gitleaks
+        gitleaks version
+
+    # Runs BEFORE the scan and always fails the job on its own.
+    #
+    # The scan itself cannot catch a config that loads cleanly while detecting
+    # nothing - it just goes green - and that is not hypothetical: bike4mind shipped a
+    # `[useBuiltinRules]` table that parsed as an empty table and left every builtin
+    # rule disabled. Nothing failed and nothing was caught.
+    - name: Verify the gitleaks config actually detects
+      shell: bash
+      env:
+        GITLEAKS_REQUIRED: '1'
+      run: sh "${{ github.action_path }}/gitleaks-config-selftest.sh" "${{ steps.cfg.outputs.config }}"
+
+    - name: Run gitleaks
+      id: gitleaks
+      shell: bash
+      env:
+        CONFIG: ${{ steps.cfg.outputs.config }}
+        MODE: ${{ inputs.scan-mode }}
+        BASE: ${{ steps.cfg.outputs.base }}
+      run: |
+        set -euo pipefail
+        report="$RUNNER_TEMP/gitleaks-report.json"
+
+        # Exit status is deliberately ignored and the report is counted instead:
+        # gitleaks exits non-zero both for findings and for a bad invocation, so
+        # branching on status reports "clean" or "found" for a scan that never ran.
+        # --exit-code=0 makes the distinction explicit; a genuine crash still trips
+        # the pipefail check below via the missing report.
+        if [ "$MODE" = "history" ]; then
+          echo "Scanning full history"
+          gitleaks git --config "$CONFIG" --no-banner --redact --exit-code=0 \
+            --report-format json --report-path "$report" .
+        else
+          if [ -z "$BASE" ]; then
+            echo "::error::diff mode needs a base ref; pass base-ref for non-PR events"
+            exit 1
+          fi
+          echo "Scanning commits in ${BASE}..HEAD"
+          gitleaks git --config "$CONFIG" --no-banner --redact --exit-code=0 \
+            --log-opts="${BASE}..HEAD" \
+            --report-format json --report-path "$report" .
+        fi
+
+        if [ ! -f "$report" ]; then
+          echo "::error::gitleaks produced no report - treat as a scan outage"
+          exit 1
+        fi
+        count=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" "$report")
+        echo "findings=$count" >> "$GITHUB_OUTPUT"
+        echo "gitleaks findings: $count"
+        if [ "$count" -gt 0 ]; then
+          # Values are redacted in the report by --redact, so this is safe to print.
+          # Kept to ONE physical line on purpose: inside a YAML literal block scalar
+          # every continuation line must stay indented, so a multi-line script or a
+          # heredoc terminator silently ends the block instead of the command.
+          python3 -c "import json,sys;[print('::error file=%s,line=%s::%s: %s' % (f['File'],f['StartLine'],f['RuleID'],f['Description'])) for f in json.load(open(sys.argv[1]))]" "$report"
+        fi
+
+    - name: Install trufflehog
+      if: inputs.run-trufflehog == 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.trufflehog-version }}
+      run: |
+        set -euo pipefail
+        curl -sSfL "https://github.com/trufflesecurity/trufflehog/releases/download/v${VERSION}/trufflehog_${VERSION}_linux_amd64.tar.gz" \
+          | sudo tar -xz -C /usr/local/bin trufflehog
+        trufflehog --version
+
+    - name: Run trufflehog with credential verification
+      id: trufflehog
+      if: inputs.run-trufflehog == 'true'
+      shell: bash
+      env:
+        MODE: ${{ inputs.scan-mode }}
+        BASE: ${{ steps.cfg.outputs.base }}
+      run: |
+        set -euo pipefail
+        report="$RUNNER_TEMP/trufflehog-report.json"
+        args="--only-verified --json --no-update"
+        if [ "$MODE" != "history" ] && [ -n "$BASE" ]; then
+          args="$args --since-commit $BASE"
+        fi
+        # shellcheck disable=SC2086
+        trufflehog git "file://$PWD" $args > "$report" || true
+        verified=$(grep -c '"SourceMetadata"' "$report" 2>/dev/null) || verified=0
+        echo "verified=${verified:-0}" >> "$GITHUB_OUTPUT"
+        echo "trufflehog verified-live findings: ${verified:-0}"
+        if [ "${verified:-0}" -gt 0 ]; then
+          echo "::error::trufflehog verified ${verified} credential(s) as CURRENTLY LIVE."
+          echo "::error::Rotate them. Deleting the commit does not revoke a key."
+        fi
+
+    - name: Decide the outcome
+      shell: bash
+      env:
+        GITLEAKS: ${{ steps.gitleaks.outputs.findings }}
+        TRUFFLEHOG: ${{ steps.trufflehog.outputs.verified }}
+        FAIL: ${{ inputs.fail-on-findings }}
+      run: |
+        set -euo pipefail
+        total=$(( ${GITLEAKS:-0} + ${TRUFFLEHOG:-0} ))
+        {
+          echo "### Secrets scan"
+          echo ""
+          echo "| Scanner | Findings |"
+          echo "|---|---|"
+          echo "| gitleaks | ${GITLEAKS:-0} |"
+          echo "| trufflehog (verified live) | ${TRUFFLEHOG:-0} |"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$total" -gt 0 ] && [ "$FAIL" = "true" ]; then
+          echo "::error::$total secret finding(s). Rotate the credential, then remove it."
+          exit 1
+        fi
+        echo "No secrets found."

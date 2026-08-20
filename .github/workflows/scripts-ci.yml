@@ -5,6 +5,7 @@ on:
     paths:
       - 'scripts/**'
       - '.github/actions/check-overlay-deps/**'
+      - '.github/actions/secrets-scan/**'
 
 permissions:
   contents: read
@@ -35,3 +36,31 @@ jobs:
       - name: Run unit tests
         working-directory: .github/actions/check-overlay-deps
         run: node --test lib.test.mjs
+
+  test-secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      # The self-test needs a real gitleaks. Pinned to the same version the action
+      # installs, because rule regexes and the builtin charset differ across versions
+      # and a self-test passing on a different binary proves nothing about the action.
+      - name: Install gitleaks
+        env:
+          VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Self-test the org default gitleaks config
+        env:
+          GITLEAKS_REQUIRED: '1'
+        run: sh .github/actions/secrets-scan/gitleaks-config-selftest.sh
+      - name: Test that the self-test actually rejects broken configs
+        run: sh .github/actions/secrets-scan/gitleaks-config-selftest.test.sh
+      - name: Validate action and workflow YAML
+        run: |
+          python3 -c "import yaml,sys;[yaml.safe_load(open(f)) for f in sys.argv[1:]]" \
+            .github/actions/secrets-scan/action.yml \
+            .github/workflows/secrets-scan.yml
