@@ -6,6 +6,9 @@ on:
       - 'scripts/**'
       - '.github/actions/check-overlay-deps/**'
       - '.github/actions/secrets-scan/**'
+      # Every workflow file, so a new reusable cannot land unvalidated. secrets-sweep
+      # was opened with zero checks reported because nothing here matched it.
+      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -59,8 +62,42 @@ jobs:
         run: sh .github/actions/secrets-scan/gitleaks-config-selftest.sh
       - name: Test that the self-test actually rejects broken configs
         run: sh .github/actions/secrets-scan/gitleaks-config-selftest.test.sh
-      - name: Validate action and workflow YAML
+      # Parses every workflow and action file, and additionally extracts each `run:`
+      # script and syntax-checks it. A block scalar that swallowed a heredoc, or an
+      # indented heredoc terminator, parses as valid YAML and fails only at runtime.
+      - name: Validate all action and workflow YAML, and every run script
         run: |
-          python3 -c "import yaml,sys;[yaml.safe_load(open(f)) for f in sys.argv[1:]]" \
-            .github/actions/secrets-scan/action.yml \
-            .github/workflows/secrets-scan.yml
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, subprocess, sys, tempfile, os, yaml
+
+          failed = []
+          files = sorted(glob.glob('.github/workflows/*.yml') + glob.glob('.github/actions/*/action.yml'))
+          for path in files:
+              doc = yaml.safe_load(open(path))
+              steps = []
+              if 'jobs' in doc:
+                  for job in doc['jobs'].values():
+                      steps += job.get('steps') or []
+              elif 'runs' in doc:
+                  steps += doc['runs'].get('steps') or []
+              for i, st in enumerate(steps):
+                  script = st.get('run')
+                  if not script:
+                      continue
+                  shell = 'sh' if st.get('shell') == 'sh' else 'bash'
+                  with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as fh:
+                      fh.write(script)
+                      tmp = fh.name
+                  res = subprocess.run([shell, '-n', tmp], capture_output=True, text=True)
+                  os.unlink(tmp)
+                  if res.returncode != 0:
+                      failed.append(f"{path} step {i} ({st.get('name', 'unnamed')}): {res.stderr.strip()}")
+              print(f'ok: {path}')
+          if failed:
+              print('\nFAILED:')
+              for f in failed:
+                  print('  ' + f)
+              sys.exit(1)
+          print(f'\n{len(files)} file(s) parsed, every run script syntax-checked')
+          PY
