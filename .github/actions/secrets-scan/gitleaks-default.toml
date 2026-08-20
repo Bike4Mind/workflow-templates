@@ -87,6 +87,26 @@ regexes = [
 ]
 
 [[rules]]
+id = "b4m-aws-secret-access-key"
+description = "AWS secret access key"
+# gitleaks has no builtin rule for a STANDALONE AWS secret key - only for the access
+# key id - because a bare 40-character base64 run is indistinguishable from any other
+# high-entropy string, and matching it on entropy alone is exactly the noise that got
+# generic-api-key disabled below.
+#
+# Found by parity-testing against GHAS on a repo of planted shapes: GHAS reported the
+# secret key and we did not. Anchoring on the surrounding key NAME rather than the
+# value keeps it precise. Covers aws_secret_access_key, AWS-SECRET-ACCESS-KEY and
+# awsSecretAccessKey.
+#
+# Group 1 is the credential itself so the entropy floor scores the secret, not a
+# separator - every other group here is non-capturing on purpose.
+regex = "(?i)aws[_-]?secret[_-]?access[_-]?key[\"'\\s:=]{1,10}([A-Za-z0-9/+=]{40})"
+tags = ["aws", "credential"]
+secretGroup = 1
+entropy = 3.5
+
+[[rules]]
 id = "b4m-jwt-secret"
 description = "JWT signing secret"
 # gitleaks compiles rule regexes without the multiline flag, so `^` matches only the

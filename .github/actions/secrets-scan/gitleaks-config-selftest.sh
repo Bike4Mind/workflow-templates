@@ -178,6 +178,10 @@ SESSION_KEY="SESSION_SECRET"
 
 assert_rule_reachable b4m-mongodb-uri \
   "const uri = '$MONGO_SCHEME://svc_$(rand_str 'a-z0-9' 8):$(rand_str 'A-Za-z0-9' 24)@cluster0.$(rand_str 'a-z0-9' 5).mongodb.net/app';"
+# Anchored on the key NAME, so the canary needs that name adjacent to the value.
+AWS_SECRET_KEY_NAME="aws_secret_access_key"
+assert_rule_reachable b4m-aws-secret-access-key \
+  "$AWS_SECRET_KEY_NAME = '$(rand_str 'A-Za-z0-9' 40)'"
 assert_rule_reachable b4m-jwt-secret \
   "B4M_$JWT_KEY=$(rand_str 'A-Za-z0-9' 40)"
 assert_rule_reachable b4m-session-secret \
