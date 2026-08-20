@@ -84,15 +84,24 @@ runs:
         fi
         echo "base=$base" >> "$GITHUB_OUTPUT"
 
+    # Installed into RUNNER_TEMP and put on PATH rather than /usr/local/bin via sudo.
+    #
+    # sudo is a GitHub-hosted-runner assumption. These jobs are meant to run on the
+    # self-hosted b4m-deployer fleet, where passwordless sudo is not guaranteed, and a
+    # job that cannot install its scanner fails closed - which on a security check
+    # reads as "could not verify" rather than "clean", but only if someone looks.
+    # Writing to a directory the runner already owns removes the question.
     - name: Install gitleaks
       shell: bash
       env:
         VERSION: ${{ inputs.gitleaks-version }}
       run: |
         set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/secrets-scan-bin"
         curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
-          | sudo tar -xz -C /usr/local/bin gitleaks
-        gitleaks version
+          | tar -xz -C "$RUNNER_TEMP/secrets-scan-bin" gitleaks
+        echo "$RUNNER_TEMP/secrets-scan-bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/secrets-scan-bin/gitleaks" version
 
     # Runs BEFORE the scan and always fails the job on its own.
     #
@@ -159,9 +168,11 @@ runs:
         VERSION: ${{ inputs.trufflehog-version }}
       run: |
         set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/secrets-scan-bin"
         curl -sSfL "https://github.com/trufflesecurity/trufflehog/releases/download/v${VERSION}/trufflehog_${VERSION}_linux_amd64.tar.gz" \
-          | sudo tar -xz -C /usr/local/bin trufflehog
-        trufflehog --version
+          | tar -xz -C "$RUNNER_TEMP/secrets-scan-bin" trufflehog
+        echo "$RUNNER_TEMP/secrets-scan-bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/secrets-scan-bin/trufflehog" --version
 
     - name: Run trufflehog with credential verification
       id: trufflehog
