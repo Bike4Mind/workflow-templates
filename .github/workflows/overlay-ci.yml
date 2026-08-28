@@ -229,6 +229,51 @@ jobs:
           overlay_path: packages/premium/${{ inputs.overlay_name }}
           host_root: .
 
+      # Every overlay's tsconfig EXCLUDES its host-coupled files - the React `.tsx`,
+      # the `@client`/`@server` aliases, the host `Request` augmentation - because they
+      # cannot resolve against the overlay's standalone tsconfig. They are meant to be
+      # typechecked by the HOST build once composed in. That is a defensible split for
+      # TYPES. It is not defensible for SYNTAX: an excluded file is never opened by
+      # `Typecheck` below, no test imports it, and the host gitignores packages/premium/*
+      # so the host's own CI never sees it either. Nothing on any PR gate parses those
+      # files. The first parser to touch them is the composed Next/Turbopack build, which
+      # only runs in a deploy.
+      #
+      # That is how b4m-bob#246 merged green on 2026-08-28 with a JSX comment placed
+      # inside a ternary's parens (`{cond ? ( {/* ... */} <p>`, where `{` opens an object
+      # literal rather than a JSX comment). src/spa/BobReport.tsx is on bob's exclude list,
+      # so CI passed; staging died four minutes later on `Expected '</', got 'ident'`.
+      # Same file, same exclude list, second time - b4m-bob#92 was the first, and the
+      # `Check overlay dependency declarations` step above was that fix. Resolution is not
+      # compilation, and neither one is parsing.
+      #
+      # `--noCheck` (TS 5.6+) reports parse and emit errors only, so unresolvable host
+      # imports stay silent and no tsconfig is consulted - files named on the command line
+      # bypass `include`/`exclude` entirely. Measured on all six overlays at 1105 files:
+      # clean, and 1.4s for the largest. A tsc too old for `--noCheck` rejects the flag and
+      # fails the step, which is the direction we want it to fail.
+      - name: Parse every overlay source file
+        env:
+          OVERLAY_PATH: packages/premium/${{ inputs.overlay_name }}
+        run: |
+          set -euo pipefail
+          tsc="$(pnpm bin)/tsc"
+          if [ ! -x "$tsc" ]; then
+            echo "::error::typescript is not installed at the host root ($tsc), so overlay sources cannot be parse-checked."
+            exit 1
+          fi
+          count=$(find "${OVERLAY_PATH}/src" -type f \( -name '*.ts' -o -name '*.tsx' \) | wc -l)
+          # Zero files would turn this gate off without anyone noticing - the exact class of
+          # failure it exists to catch - so treat an empty list as a hard error.
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no .ts/.tsx files under ${OVERLAY_PATH}/src, so this gate is not gating. Did the overlay layout change?"
+            exit 1
+          fi
+          echo "parsing ${count} file(s) under ${OVERLAY_PATH}/src"
+          find "${OVERLAY_PATH}/src" -type f \( -name '*.ts' -o -name '*.tsx' \) -print0 \
+            | xargs -0 "$tsc" --noCheck --noEmit --skipLibCheck \
+                --jsx react-jsx --target esnext --module esnext --moduleResolution bundler
+
       - name: Build core packages
         run: pnpm core:build
 
