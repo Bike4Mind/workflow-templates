@@ -41,6 +41,21 @@ jobs:
         working-directory: .github/actions/check-overlay-deps
         run: node --test lib.test.mjs
 
+  test-bot-fold-write-path:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      # Guards pr-bot-review.yml's write path: what the fold-mode agent can touch, what the
+      # push step will and will not commit, and every gate a fold run has to clear. See the
+      # comment at the top of checkBotFoldWritePath.test.mjs.
+      - name: Bot-fold write path self-test
+        run: node --test .github/scripts/checkBotFoldWritePath.test.mjs
+
   test-redact-review-transcript:
     runs-on: ubuntu-latest
     steps:
