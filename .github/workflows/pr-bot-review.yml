@@ -486,9 +486,10 @@ jobs:
               The fold commit is pushed right after your review lands, and a repo
               that dismisses stale reviews on push would show an approval that
               reads as a green sign-off for a moment and then is dismissed by your
-              own fix. Use COMMENT when everything you found was folded in and
-              REQUEST_CHANGES when something was not, and say in the review
-              body which findings you applied and which you left.
+              own fix. Use REQUEST_CHANGES when a P0/P1 finding was left
+              unfolded, and COMMENT otherwise: an unfolded P2/P3 does not
+              block. Say in the review body which findings you applied and
+              which you left.
             - This step is a single non-interactive process: nothing external
               will notify you or re-invoke you later, no matter how the skill
               is written. Treat every Agent/Task dispatch as synchronous: wait
