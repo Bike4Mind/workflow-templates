@@ -3021,6 +3021,11 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // `Report incomplete review` carries, which keeps one reporter on the cancelled ORDINARY
     // fetch failure that `!cancelled()` had left with none; the review step's conjunct is
     // REDUNDANT under Actions' implicit `success()` and is kept as a belt - see the workflow.
+    // The guard must not run on a fold: a fold right after a review is on the same head, which
+    // the guard reads as "unchanged" and skips every step below it.
+    expect(ifLine(src, 'Substantive-change guard - skip changeset-only re-reviews')).toBe(
+      "inputs.changeset_guard == true && env.FOLD_MODE != 'true' && steps.size_check.outputs.skip == 'false'"
+    );
     expect(ifLine(src, 'Run /bot-review')).toBe(
       "steps.size_check.outputs.skip == 'false' && steps.substantive.outputs.skip != 'true' && steps.skill_fetch.outcome == 'success'"
     );
