@@ -129,7 +129,8 @@ on:
           Space-separated extra repo-root-relative directory names (no
           trailing slash) added to the fold push's write-path deny list,
           alongside .github, .husky, .claude, .changeset, scripts, infra and
-          patches.
+          patches. Each entry is a plain path such as `docs` or `apps/infra`,
+          not a glob; an entry that is not refuses every fold.
         type: string
         default: ''
       install_bubblewrap:
@@ -173,7 +174,7 @@ jobs:
       github.event.pull_request.draft == false &&
       !contains(format(' {0} ', inputs.protected_base_refs), format(' {0} ', github.event.pull_request.base.ref)) &&
       !contains(format(' {0} ', inputs.protected_head_refs), format(' {0} ', github.event.pull_request.head.ref)) &&
-      !startsWith(github.event.pull_request.head.ref, inputs.skip_head_ref_prefix)
+      (inputs.skip_head_ref_prefix == '' || !startsWith(github.event.pull_request.head.ref, inputs.skip_head_ref_prefix))
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     env:
@@ -322,6 +323,7 @@ jobs:
           private-key: ${{ secrets.PREMIUM_OVERLAY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ inputs.skill_repo }}
+          permission-contents: read
 
       - name: Fetch bot-review skill (fail loud)
         id: skill_fetch
@@ -339,6 +341,12 @@ jobs:
           # replaced). Path is lowercase `skill.md` to match the skill repo's
           # convention - the runner is case-sensitive, so this must stay in lockstep
           # with that repo.
+          # `required: true` stops an omitted ref, not a branch name. A moving ref makes
+          # every merge in the skill repo live on the next review.
+          if ! printf '%s\n' "$SKILL_REF" | grep -qxE '[0-9a-f]{40}'; then
+            echo "::error::skill_ref must be a full 40-character commit SHA, not '${SKILL_REF}'. Refusing to review against a moving ref."
+            exit 1
+          fi
           if ! gh api "repos/${OWNER}/${SKILL_REPO}/contents/.claude/skills/bot-review/skill.md?ref=${SKILL_REF}" \
                  --jq '.content' | base64 -d > "$DEST"; then
             echo "::error::Could not fetch bot-review skill from ${SKILL_REPO} (token / access / path). Refusing to run a degraded review."
@@ -555,7 +563,7 @@ jobs:
             # expressions have no way to take a parent), so it is a premise about the
             # HOSTED image, stated the way the $PATH exec-bit premise below is: a
             # self-hosted runner with a different work root needs its own entry, and
-            # `runs-on` reads a repo variable. `_*` rather than `_actions` so the sibling
+            # `runs-on` reads an input. `_*` rather than `_actions` so the sibling
             # kind is covered rather than the one instance of it - `_temp`, `_tool`,
             # `_diag` and `_runner_file_commands` are all the runner's, and the checkout
             # (`<work>/<repo>/<repo>`) is the only thing there that is not.
@@ -581,10 +589,16 @@ jobs:
             # permission rule is consulted. What covers that case is the job's fork gate:
             # `head.repo.full_name == github.repository` means the branch is in this repo, so
             # anyone who could ship such a file could edit the caller's workflow directly.
-            # NOT fenced, and stated rather than left to be discovered: `$HOME`, and the
-            # process CWD, which on a hosted runner is the checkout. A blanket deny is
-            # not available for either - the checkout itself lives under `$HOME`
-            # (`/home/runner/work/...`), so denying `$HOME` would deny the fold. The
+            # `$HOME`'s dotfiles and dot-directories ARE fenced, on both arms: they are
+            # where startup files live, and some post-agent programs are not ours to bound
+            # per-step - checkout's post step runs `git submodule foreach` over a copy of
+            # `~/.gitconfig`, and claude-code-action's own post-agent steps run programs
+            # with no `env:` this file controls. The checkout under `work/` is not a
+            # dotfile, so the fold is unaffected.
+            # NOT fenced, and stated rather than left to be discovered: the rest of
+            # `$HOME`, and the process CWD, which on a hosted runner is the checkout. A
+            # blanket deny is not available for either - the checkout itself lives under
+            # `$HOME` (`/home/runner/work/...`), so denying `$HOME` would deny the fold. The
             # bound is therefore per-step, and the invariant a new step has to satisfy,
             # stated as the class rather than as the two instances that have bitten so
             # far: EVERY PROGRAM A POST-AGENT STEP RUNS MUST HAVE ALL OF ITS IMPLICIT,
@@ -664,7 +678,7 @@ jobs:
             # ScheduleWakeup makes sense only in an interactive session; this
             # process is single-shot, so hard-block the tool call itself
             # rather than relying on the prompt bullet above alone.
-            --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**)' }}"
+            --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),Edit(//home/runner/.*),Edit(//home/runner/.*/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**)' }}"
             --max-turns ${{ inputs.max_turns }}
 
       - name: Verify a review was actually posted
@@ -848,10 +862,22 @@ jobs:
           # here, never spliced as a GitHub Actions expression into this script: a
           # directory name is data, not code, and that splice is the shape every
           # Actions script injection takes.
+          # Each name is validated before it reaches the ERE: an unbalanced `[` or `(`
+          # would make the guard's grep exit 2 and refuse nothing. Split on whitespace
+          # by `tr`, never by an unquoted expansion, so a `*` is validated as written.
           EXTRA_DIR_ALT=""
-          if [ -n "${EXTRA_WRITE_DENY_GLOBS:-}" ]; then
-            EXTRA_DIR_ALT="|$(printf '%s' "$EXTRA_WRITE_DENY_GLOBS" | tr ' ' '|')"
-          fi
+          EXTRA_DIR_LIST=$(printf '%s' "${EXTRA_WRITE_DENY_GLOBS:-}" | tr -s '[:space:]' '\n')
+          while read -r dir; do
+            if [ -n "$dir" ] && ! printf '%s\n' "$dir" | grep -qxE '[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)*'; then
+              echo "::error::extra_write_deny_globs entry '${dir}' is not a plain directory path; refusing the fold rather than running the path guard without it"
+              echo "reason=this repo's \`extra_write_deny_globs\` setting holds an entry that is not a plain directory path, so the path guard could not be built and nothing was pushed. The workflow caller needs fixing, not the PR." >> "$GITHUB_OUTPUT"
+              emit blocked
+              exit 1
+            fi
+            if [ -n "$dir" ]; then
+              EXTRA_DIR_ALT="${EXTRA_DIR_ALT}|${dir//./\\.}"
+            fi
+          done <<< "$EXTRA_DIR_LIST"
 
           # PATH GUARD. `git add -u` bounds the commit to tracked files; this bounds
           # it by path. Read the bound precisely: it keeps a fold out of CI
@@ -949,7 +975,7 @@ jobs:
               -e '(^|/)Dockerfile(\..*)?$' \
               -e '\.(sh|bash|zsh)$' \
               -e '^[^/.]+$' \
-              -e '^\.[^/]*$' "$STAGED_PATHS" | tr '\0' '\n' || true
+              -e '^\.[^/]*$' "$STAGED_PATHS" | tr '\0' '\n' || [ $? -eq 1 ] || exit 2
             # Refused here rather than by the size bound below, which numstat reports
             # as 0 changed lines for a binary however large the rewrite. A fold
             # applies textual review findings, so a staged binary is not one.
@@ -1329,7 +1355,10 @@ jobs:
         # skipped review is not, so that state commented nothing. Negating the conjunction only for
         # a fold run keeps exactly one reporter on every one of them. Single-line rather than a
         # block scalar, which is safe because the value now opens with `always()` rather than `!`.
-        if: always() && steps.skill_fetch.outcome == 'failure' && !(cancelled() && env.FOLD_MODE == 'true')
+        # The mint is in the gate too: a failed mint SKIPS the fetch, and a skipped fetch
+        # matches no reporter, so a caller missing its App variable got a red check and a
+        # consumed label with no comment.
+        if: always() && (steps.skill_token.outcome == 'failure' || steps.skill_fetch.outcome == 'failure') && !(cancelled() && env.FOLD_MODE == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}

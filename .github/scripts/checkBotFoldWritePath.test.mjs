@@ -1255,6 +1255,10 @@ const ALWAYS_ON_EDIT_FENCES = [
   'Edit(//home/runner/work/_*/**)',
   'Edit(//home/runner/runners/**)',
   'Edit(//home/runner/.bun/**)',
+  // Every $HOME dotfile and dot-directory: startup files for post-agent programs this file
+  // cannot give an `env:`, such as checkout's post step and the action's own trailing steps.
+  'Edit(//home/runner/.*)',
+  'Edit(//home/runner/.*/**)',
 ];
 
 /** The runner the three `/home/runner/...` fences above are a premise about. */
@@ -1372,7 +1376,8 @@ function ifConjuncts(src        , name        )           {
 function runStagedGuards(
   src        ,
   files              ,
-  home                          
+  home                          ,
+  extraDeny = ''
 )                                  {
   const commands = step(src, 'Push fold commit');
   // Lifted from the staged-path enumeration, which sits OUTSIDE `BLOCKED=$( )` precisely so
@@ -1419,6 +1424,7 @@ function runStagedGuards(
       'set -euo pipefail',
       'emit() { echo "emit:$1"; }',
       `GITHUB_OUTPUT=${JSON.stringify(path.join(dir, 'outputs'))}`,
+      `EXTRA_WRITE_DENY_GLOBS=${JSON.stringify(extraDeny)}`,
       region ?? '',
       'echo GUARDS_PASSED',
     ].join('\n');
@@ -1848,7 +1854,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'github.event.pull_request.draft == false',
       "!contains(format(' {0} ', inputs.protected_base_refs), format(' {0} ', github.event.pull_request.base.ref))",
       "!contains(format(' {0} ', inputs.protected_head_refs), format(' {0} ', github.event.pull_request.head.ref))",
-      '!startsWith(github.event.pull_request.head.ref, inputs.skip_head_ref_prefix)',
+      // `startsWith(x, '')` is true, so an empty prefix has to mean "no skip", not "skip all".
+      "(inputs.skip_head_ref_prefix == '' || !startsWith(github.event.pull_request.head.ref, inputs.skip_head_ref_prefix))",
     ]);
 
     // The key SETS, for the reason above: a bound that is a property of which keys are present
@@ -2811,6 +2818,13 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     }
   });
 
+  it('mints the skill-repo token read-only', () => {
+    const mint = withoutComments(step(src, 'Mint skill-repo read token'));
+    const keys = [...mint.matchAll(/^ {10}([a-z-]+):/gm)].map(m => m[1]).sort();
+    expect(keys).toEqual(['client-id', 'owner', 'permission-contents', 'private-key', 'repositories'].sort());
+    expect(mint).toMatch(/^ {10}permission-contents: read$/m);
+  });
+
   it('mints the fold token with contents: write and no workflow scope', () => {
     const mintStep = step(src, 'Mint fold push token');
     expect(mintStep).toMatch(/^\s*permission-contents: write$/m);
@@ -2946,6 +2960,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       foldMode,
       steps: {
         bot_review: { outcome: 'success', outputs: { conclusion: 'success' } },
+        skill_token: { outcome: 'success' },
         skill_fetch: { outcome: 'success' },
         review_posted: { outcome: 'success', outputs: { posted: posted ? 'true' : '' } },
         push_token: { outcome: minted ? 'success' : 'failure' },
@@ -3013,7 +3028,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // `if: !cancelled() && ...` is the tag `!cancelled()` and the workflow will not load. Opening
     // with `always()` is what lets this one be pinned by `ifLine` instead of by conjunct set.
     expect(ifLine(src, 'Report skill-fetch failure')).toBe(
-      "always() && steps.skill_fetch.outcome == 'failure' && !(cancelled() && env.FOLD_MODE == 'true')"
+      "always() && (steps.skill_token.outcome == 'failure' || steps.skill_fetch.outcome == 'failure') && !(cancelled() && env.FOLD_MODE == 'true')"
     );
     for (const cancelled of [false, true]) {
       for (const foldMode of [false, true]) {
@@ -3023,6 +3038,15 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         expect(
           firing(noSkill),
           `a failed skill fetch was outside the sweep: cancelled=${cancelled} fold=${foldMode}`
+        ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skill-fetch failure']);
+        // A failed MINT skips the fetch rather than failing it, and must still be reported.
+        const noToken = state(cancelled, foldMode, false, false, false);
+        noToken.steps.skill_token = { outcome: 'failure' };
+        noToken.steps.skill_fetch = { outcome: 'skipped' };
+        noToken.steps.bot_review = { outcome: 'skipped', outputs: {} };
+        expect(
+          firing(noToken),
+          `a failed skill-token mint was outside the sweep: cancelled=${cancelled} fold=${foldMode}`
         ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skill-fetch failure']);
       }
     }
@@ -3271,6 +3295,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     );
     expect(exits).toEqual([
       ['none', '\n', 'exit 0', '\n'],
+      // An unusable extra_write_deny_globs entry, before the path guard is built.
+      ['blocked', '\n', 'exit 1', '\n'],
       ['blocked', '\n', 'exit 1', '\n'],
       ['blocked', '\n', 'exit 1', '\n'],
       ['true', '\n', 'exit 0', '\n'],
@@ -3378,11 +3404,43 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       '$1              # A comment here ends the grep, silently.\n$2'
     );
     expect(broken, 'the injection anchor moved').not.toBe(src);
-    // The arms after the comment are gone, so an extensionless root file sails through.
+    // The arms after the comment are gone. The orphaned `-e` exits 127, which the grep-status
+    // check now turns into a failed step rather than a pass - but not into a refusal.
     const mutant = runStagedGuards(broken, [{ path: 'dev' }]);
-    expect(mutant.status, mutant.out).toBe(0);
+    expect(mutant.status, mutant.out).toBe(2);
+    expect(mutant.out).not.toContain('emit:blocked');
     // While the shipped bytes block it - which is the pair that makes the above meaningful.
     expect(runStagedGuards(src, [{ path: 'dev' }]).status).toBe(1);
+  });
+
+  it('refuses a caller-supplied extra directory, and fails closed on one it cannot use', () => {
+    // A valid name joins the directory arm; its `.` is literal, not "any character".
+    expect(runStagedGuards(src, [{ path: 'docs.v2/a.md' }], undefined, 'gen docs.v2').status).toBe(1);
+    expect(runStagedGuards(src, [{ path: 'gen/x.ts' }], undefined, 'gen docs.v2').status).toBe(1);
+    expect(runStagedGuards(src, [{ path: 'apps/infra/x.ts' }], undefined, 'apps/infra').status).toBe(1);
+    const lookalike = runStagedGuards(src, [{ path: 'docsXv2/a.md' }], undefined, 'docs.v2');
+    expect(lookalike.status, lookalike.out).toBe(0);
+    expect(runStagedGuards(src, [{ path: 'gen/x.ts' }]).status, 'gen/ refused with no extra set').toBe(0);
+
+    // An entry that is not a plain path refuses the fold, even for a path it would not name:
+    // an unbalanced bracket used to make grep exit 2 and turn every arm off.
+    for (const bad of ['docs [bad', 'docs(', 'gen*', 'docs/', '../x', '-e']) {
+      const run = runStagedGuards(src, [{ path: 'src/a.ts' }], undefined, bad);
+      expect(run.status, `accepted extra deny entry ${JSON.stringify(bad)}: ${run.out}`).toBe(1);
+      expect(run.out).toContain('emit:blocked');
+      expect(run.out).not.toContain('GUARDS_PASSED');
+    }
+
+    // Behind the validation, grep's own exit 2 still fails the step. Disarm the validation and
+    // splice a malformed entry through: the CI path must not pass.
+    const unvalidated = src.replace(
+      `if [ -n "$dir" ] && ! printf '%s\\n' "$dir" | grep -qxE '[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)*'; then`,
+      'if false; then'
+    );
+    expect(unvalidated, 'the validation anchor moved').not.toBe(src);
+    const swallowed = runStagedGuards(unvalidated, [{ path: '.github/workflows/ci.yml' }], undefined, 'docs[');
+    expect(swallowed.status, swallowed.out).not.toBe(0);
+    expect(swallowed.out).not.toContain('GUARDS_PASSED');
   });
 
   it('refuses a staged binary and a non-ASCII CI path', () => {
@@ -3739,5 +3797,40 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // itself is parameterised), so a bump cannot leave one of them stale.
     expect(withoutComments(fetch)).toMatch(/skill\.md\?ref=\$\{SKILL_REF\}"/);
     expect(withoutComments(fetch)).toMatch(/from \$\{SKILL_REPO\}@\$\{SKILL_REF\}"/);
+
+    // `required: true` stops an omitted ref, not a branch name, so the fetch refuses one.
+    // Executed with a `gh` that would serve any ref, so only the shape check can refuse.
+    const runFetch = (ref) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-fold-fetch-'));
+      try {
+        const bin = path.join(dir, 'bin');
+        fs.mkdirSync(bin);
+        fs.writeFileSync(path.join(bin, 'gh'), '#!/bin/sh\necho eAo=\n', { mode: 0o755 });
+        const run = spawnSync('bash', ['-c', `set -euo pipefail\n${runBodiesRaw(fetch).join('\n')}`], {
+          cwd: dir,
+          encoding: 'utf8',
+          timeout: 60_000,
+          env: {
+            ...process.env,
+            PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+            DEST: path.join(dir, 'skill.md'),
+            GITHUB_OUTPUT: path.join(dir, 'outputs'),
+            OWNER: 'owner',
+            SKILL_REPO: 'skills',
+            SKILL_REF: ref,
+          },
+        });
+        return { status: run.status ?? -1, out: `${run.stdout}${run.stderr}` };
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const pinned = runFetch('e280101f0e1e2d3c4b5a69788796a5b4c3d2e1f0');
+    expect(pinned.status, pinned.out).toBe(0);
+    for (const moving of ['main', 'v1', 'e280101', 'E280101F0E1E2D3C4B5A69788796A5B4C3D2E1F0', '']) {
+      const run = runFetch(moving);
+      expect(run.status, `accepted skill_ref ${JSON.stringify(moving)}`).toBe(1);
+      expect(run.out).toContain('skill_ref must be a full 40-character commit SHA');
+    }
   });
 });
