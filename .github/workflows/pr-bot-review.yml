@@ -252,7 +252,9 @@ jobs:
 
       - name: Substantive-change guard - skip changeset-only re-reviews
         id: substantive
-        if: inputs.changeset_guard == true && steps.size_check.outputs.skip == 'false'
+        # Not on a fold run: folding the findings of a review just posted on this
+        # same head is the normal flow, and the guard would read it as a no-op.
+        if: inputs.changeset_guard == true && inputs.fold_mode != true && steps.size_check.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BOT_REVIEW_LOGIN: 'claude[bot]'
