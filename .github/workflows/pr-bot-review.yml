@@ -154,7 +154,9 @@ on:
           Threaded as an input rather than read inline from `vars.RUNNER_LABEL`:
           several callers set that repo variable to a shared self-hosted deploy
           fleet, and reading it inline here would silently relocate the review
-          job onto it. The caller decides.
+          job onto it. The caller decides. A fold run refuses anything but a
+          GitHub-hosted Linux runner, because its write fences name that image's
+          paths.
         type: string
         default: ubuntu-latest
 
@@ -334,8 +336,18 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           SKILL_REPO: ${{ inputs.skill_repo }}
           SKILL_REF: ${{ inputs.skill_ref }}
+          HOST_KIND: ${{ runner.environment }}
+          HOST_OS: ${{ runner.os }}
         run: |
           set -euo pipefail
+          # The fold's `Edit()` fences are literal `/home/runner/...` paths, and a
+          # different image matches none of them.
+          if [ "$FOLD_MODE" = "true" ]; then
+            if [ "$HOST_KIND" != "github-hosted" ] || [ "$HOST_OS" != "Linux" ]; then
+              echo "::error::A fold run needs a GitHub-hosted Linux runner, not ${HOST_KIND} ${HOST_OS}. Its write fences name that image's paths. Refusing to fold."
+              exit 1
+            fi
+          fi
           # FAIL LOUD: a missing / unreadable / empty skill must RED this step, never
           # silently fall back to a thinner inline review (the exact regression this
           # replaced). Path is lowercase `skill.md` to match the skill repo's
@@ -343,7 +355,7 @@ jobs:
           # with that repo.
           # `required: true` stops an omitted ref, not a branch name. A moving ref makes
           # every merge in the skill repo live on the next review.
-          if ! printf '%s\n' "$SKILL_REF" | grep -qxE '[0-9a-f]{40}'; then
+          if [ "${#SKILL_REF}" -ne 40 ] || ! printf '%s\n' "$SKILL_REF" | grep -qxE '[0-9a-f]{40}'; then
             echo "::error::skill_ref must be a full 40-character commit SHA, not '${SKILL_REF}'. Refusing to review against a moving ref."
             exit 1
           fi
@@ -589,7 +601,8 @@ jobs:
             # permission rule is consulted. What covers that case is the job's fork gate:
             # `head.repo.full_name == github.repository` means the branch is in this repo, so
             # anyone who could ship such a file could edit the caller's workflow directly.
-            # `$HOME`'s dotfiles and dot-directories ARE fenced, on both arms: they are
+            # `$HOME`'s dotfiles and dot-directories ARE fenced, on both arms (the fetch
+            # step refuses a fold on any other image, so the literal paths hold): they are
             # where startup files live, and some post-agent programs are not ours to bound
             # per-step - checkout's post step runs `git submodule foreach` over a copy of
             # `~/.gitconfig`, and claude-code-action's own post-agent steps run programs
@@ -1368,7 +1381,7 @@ jobs:
         run: |
           gh pr comment "$PR" \
             --repo "$REPO" \
-            --body "🤖 bot-review could not fetch its review skill, so no review ran (failing loud rather than posting a degraded review). See the [workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}). This is an infra issue (token/access/path), not a problem with the PR." || true
+            --body "🤖 bot-review could not fetch its review skill or refused this run's setup, so no review ran (failing loud rather than posting a degraded review). See the [workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for which. This is a workflow-setup issue, not a problem with the PR." || true
 
       - name: Remove re-review label
         if: always() && github.event.action == 'labeled' && (github.event.label.name == 'bot-review' || github.event.label.name == 'bot-review-fold')

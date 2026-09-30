@@ -1261,7 +1261,7 @@ const ALWAYS_ON_EDIT_FENCES = [
   'Edit(//home/runner/.*/**)',
 ];
 
-/** The runner the three `/home/runner/...` fences above are a premise about. */
+/** The runner the `/home/runner/...` fences above are a premise about. */
 const RUNS_ON = 'runs-on: ${{ inputs.runner_label }}';
 
 /**
@@ -2696,7 +2696,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ],
       ['Note changeset-only skip on a manual re-review', ['GH_TOKEN', 'PR', 'REPO']],
       ['Mint skill-repo read token', []],
-      ['Fetch bot-review skill (fail loud)', ['GH_TOKEN', 'DEST', 'OWNER', 'SKILL_REPO', 'SKILL_REF']],
+      ['Fetch bot-review skill (fail loud)', ['GH_TOKEN', 'DEST', 'OWNER', 'SKILL_REPO', 'SKILL_REF', 'HOST_KIND', 'HOST_OS']],
       ['Record review start time', []],
       ['Install bubblewrap', []],
       ['Run /bot-review', []],
@@ -3800,7 +3800,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
 
     // `required: true` stops an omitted ref, not a branch name, so the fetch refuses one.
     // Executed with a `gh` that would serve any ref, so only the shape check can refuse.
-    const runFetch = (ref) => {
+    const runFetch = (ref, runner = {}) => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-fold-fetch-'));
       try {
         const bin = path.join(dir, 'bin');
@@ -3818,6 +3818,10 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
             OWNER: 'owner',
             SKILL_REPO: 'skills',
             SKILL_REF: ref,
+            FOLD_MODE: 'false',
+            HOST_KIND: 'github-hosted',
+            HOST_OS: 'Linux',
+            ...runner,
           },
         });
         return { status: run.status ?? -1, out: `${run.stdout}${run.stderr}` };
@@ -3827,10 +3831,34 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     };
     const pinned = runFetch('e280101f0e1e2d3c4b5a69788796a5b4c3d2e1f0');
     expect(pinned.status, pinned.out).toBe(0);
-    for (const moving of ['main', 'v1', 'e280101', 'E280101F0E1E2D3C4B5A69788796A5B4C3D2E1F0', '']) {
+    for (const moving of [
+      'main',
+      'v1',
+      'e280101',
+      'E280101F0E1E2D3C4B5A69788796A5B4C3D2E1F0',
+      '',
+      'main\ne280101f0e1e2d3c4b5a69788796a5b4c3d2e1f0',
+    ]) {
       const run = runFetch(moving);
       expect(run.status, `accepted skill_ref ${JSON.stringify(moving)}`).toBe(1);
       expect(run.out).toContain('skill_ref must be a full 40-character commit SHA');
+    }
+
+    // The fold's write fences are literal hosted-image paths, so a fold anywhere else is refused.
+    expect(fetch).toMatch(/^ {10}HOST_KIND: \$\{\{ runner\.environment \}\}$/m);
+    expect(fetch).toMatch(/^ {10}HOST_OS: \$\{\{ runner\.os \}\}$/m);
+    const hosted = { HOST_KIND: 'github-hosted', HOST_OS: 'Linux' };
+    const sha = 'e280101f0e1e2d3c4b5a69788796a5b4c3d2e1f0';
+    expect(runFetch(sha, { ...hosted, FOLD_MODE: 'true' }).status).toBe(0);
+    for (const other of [
+      { HOST_KIND: 'self-hosted', HOST_OS: 'Linux' },
+      { HOST_KIND: 'github-hosted', HOST_OS: 'macOS' },
+      { HOST_KIND: '', HOST_OS: '' },
+    ]) {
+      const fold = runFetch(sha, { ...other, FOLD_MODE: 'true' });
+      expect(fold.status, `folded on ${JSON.stringify(other)}`).toBe(1);
+      expect(fold.out).toContain('A fold run needs a GitHub-hosted Linux runner');
+      expect(runFetch(sha, { ...other, FOLD_MODE: 'false' }).status, 'refused a review run').toBe(0);
     }
   });
 });
