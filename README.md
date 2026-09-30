@@ -45,7 +45,7 @@ jobs:
 
 - **`permissions:`** The reusable's token can only narrow what the caller grants. Without this block the job gets the repo's default read-only token, and every review write fails with 403.
 - **`concurrency:`** A group inside a called workflow does not reliably supersede the caller's run, so it lives here. The `cancel-in-progress` test must name `bot-review-fold`: a fold run never cancels a run already in flight. Workflow-level concurrency applies before the job `if:`, so every label added to the PR joins a group. The `run_id` fallback in the group key gives any other label a group of its own, so it cancels nothing.
-- **`secrets: inherit`.** The reusable declares no `secrets:` block. It reads the secrets `ANTHROPIC_API_KEY` and `PREMIUM_OVERLAY_APP_PRIVATE_KEY`, and the variable `PREMIUM_OVERLAY_CLIENT_ID`, all from the calling repo or its org.
+- **`secrets: inherit`.** The reusable declares no `secrets:` block. It reads the secrets `ANTHROPIC_API_KEY`, `PREMIUM_OVERLAY_APP_PRIVATE_KEY` and `BOT_REVIEW_APP_PRIVATE_KEY`, and the variables `PREMIUM_OVERLAY_CLIENT_ID` and `BOT_REVIEW_CLIENT_ID`, all from the calling repo or its org. The `PREMIUM_OVERLAY_*` App reads the skill repo. The `BOT_REVIEW_*` App pushes fold commits, so it needs `contents: write` on the calling repo.
 - **Both SHAs.** Pin `uses:` and `skill_ref` to full 40-character commit SHAs. `skill_ref` has no default, and the run refuses anything but a SHA.
 - **The label names, in all three places.** The `if:`, `fold_mode` and `cancel-in-progress` lines each name `bot-review-fold`. Miss the `if:` and no fold run starts. Miss `cancel-in-progress` and an incoming fold run cancels whatever is already in flight.
 

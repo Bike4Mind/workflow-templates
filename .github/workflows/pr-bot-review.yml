@@ -785,8 +785,8 @@ jobs:
           steps.review_posted.outputs.posted == 'true'
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ vars.PREMIUM_OVERLAY_CLIENT_ID }}
-          private-key: ${{ secrets.PREMIUM_OVERLAY_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.BOT_REVIEW_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_REVIEW_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           # `contents: write` and nothing else. Deliberately NOT `workflows: write`:
