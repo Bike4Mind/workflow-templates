@@ -2823,11 +2823,16 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     const keys = [...mint.matchAll(/^ {10}([a-z-]+):/gm)].map(m => m[1]).sort();
     expect(keys).toEqual(['client-id', 'owner', 'permission-contents', 'private-key', 'repositories'].sort());
     expect(mint).toMatch(/^ {10}permission-contents: read$/m);
+    expect(mint).toMatch(/^ {10}client-id: \$\{\{ vars\.PREMIUM_OVERLAY_CLIENT_ID \}\}$/m);
+    expect(mint).toMatch(/^ {10}private-key: \$\{\{ secrets\.PREMIUM_OVERLAY_APP_PRIVATE_KEY \}\}$/m);
   });
 
   it('mints the fold token with contents: write and no workflow scope', () => {
     const mintStep = step(src, 'Mint fold push token');
     expect(mintStep).toMatch(/^\s*permission-contents: write$/m);
+    // Its own App: the skill-repo App holds `contents: read` only, so sharing it fails every push.
+    expect(mintStep).toMatch(/^ {10}client-id: \$\{\{ vars\.BOT_REVIEW_CLIENT_ID \}\}$/m);
+    expect(mintStep).toMatch(/^ {10}private-key: \$\{\{ secrets\.BOT_REVIEW_APP_PRIVATE_KEY \}\}$/m);
     // As a SET, like every other permission surface here: a `permission-*` key absent from this
     // list is a scope on the push token, and two substring assertions cannot see an added one.
     expect(withKeys(src, 'Mint fold push token').sort()).toEqual(
