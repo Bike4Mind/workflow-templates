@@ -2288,7 +2288,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
 
   it('fetches the transcript redactor from its own trusted commit, never the checkout', () => {
     // `Redact and upload review transcript` EXECUTES the redactor, on the
-    // `posted != 'true'` branch - exactly where the push step's path guard never runs. This
+    // `posted != 'true'` branch - exactly where the push step's path guard never runs - and
+    // after a posted review whose submission GitHub refused. This
     // reusable's own coordinates - `job.workflow_repository` / `job.workflow_sha` - name a
     // commit independent of anything the PR head carries, unlike the CALLER's own
     // `github.sha`/`github.workflow_sha` or a `git show HEAD:...` read out of the checkout: on
@@ -2297,7 +2298,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // the private skill's own bytes as input must not be sourced from a tree the run itself
     // can influence.
     const fetch = withoutComments(step(src, 'Fetch redactor from the calling workflow\'s own commit'));
-    expect(fetch).toMatch(/^ {8}if: always\(\) && \(steps\.bot_review\.outcome == 'failure' \|\| \(steps\.bot_review\.outcome == 'success' && steps\.bot_review\.outputs\.conclusion == 'success'\)\) && steps\.review_posted\.outputs\.posted != 'true'$/m);
+    expect(fetch).toMatch(/^ {8}if: always\(\) && \(steps\.bot_review\.outcome == 'failure' \|\| \(steps\.bot_review\.outcome == 'success' && steps\.bot_review\.outputs\.conclusion == 'success'\)\) && \(steps\.review_posted\.outputs\.posted != 'true' \|\| steps\.review_refused\.outputs\.refused == 'true'\)$/m);
     expect(fetch).toMatch(/^ {10}WORKFLOW_REPO: \$\{\{ job\.workflow_repository \}\}$/m);
     expect(fetch).toMatch(/^ {10}WORKFLOW_SHA: \$\{\{ job\.workflow_sha \}\}$/m);
     expect(fetch).toMatch(/^ {10}DEST: \$\{\{ runner\.temp \}\}\/redact-review-transcript\.py$/m);
@@ -2371,8 +2372,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // CPython's `site` imports `usercustomize` from `$HOME/.local/lib/pythonX.Y/
     // site-packages` before it reads the redactor's own arguments, and an imported `.py` needs
     // no execute bit, so a 0644 file the agent wrote there executes ahead of the redactor -
-    // with this step's env, which carries SKILL_FILE - on exactly the `posted != 'true'` branch
-    // where nothing else in the job inspects anything. `$HOME` cannot be write-fenced (the
+    // with this step's env, which carries SKILL_FILE - on the `posted != 'true'` branch, where
+    // nothing else in the job inspects anything, and after a refused submission. `$HOME` cannot be write-fenced (the
     // checkout is under it on a hosted runner), so the bound is here. `-E` does NOT cover this
     // on its own, since `-I` implies it but a future edit dropping `-I` alone would not notice.
     expect(step(src, 'Redact and upload review transcript')).toMatch(/^ {10}PYTHONNOUSERSITE: '1'$/m);
@@ -2674,6 +2675,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Report fold failure',
       'Report cancelled fold',
       'Report fold no-op',
+      'Detect a refused review submission',
       "Fetch redactor from the calling workflow's own commit",
       'Redact and upload review transcript',
       'Upload review transcript',
@@ -2708,6 +2710,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ['Report fold failure', ['GH_TOKEN', 'MINT_OUTCOME', 'PUSH_REASON', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report cancelled fold', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report fold no-op', ['GH_TOKEN', 'PUSHED', 'DROPPED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Detect a refused review submission', ['EXECUTION_FILE']],
       [
         "Fetch redactor from the calling workflow's own commit",
         ['GH_TOKEN', 'DEST', 'WORKFLOW_REPO', 'WORKFLOW_SHA'],
@@ -2772,7 +2775,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       );
       const label = injected.split('\n')[0];
       expect(mutated, 'the step injection anchor moved').not.toBe(src);
-      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(22);
+      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(23);
       if (unnamed) expect(stepNames(mutated), `a name-less step was not seen: ${label}`).toContain(UNNAMED_STEP);
     }
   });
@@ -3114,6 +3117,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ['set', '-euo', 'pipefail'],
       ['set', '-uo', 'pipefail'],
       ['set', '-uo', 'pipefail'],
+      ['set', '-uo', 'pipefail'],
     ]);
     // `awk` by value, everywhere in the file, PROGRAM TEXT INCLUDED. It is the one entry in
     // `PROGRAMS` whose argument is itself a program: `awk 'BEGIN{system("git push --force
@@ -3162,6 +3166,16 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // here - stripping them would pin a program that never runs. The redirection words are kept
     // too: a `2>` appearing where one did not is a change to where this command's output goes.
     expect(commandsNamed(src, /^jq$/)).toEqual([
+      [
+        'jq',
+        '-s',
+        '-e',
+        'map(if type == "array" then .[] else . end)\n' +
+          '                       | any(.[]; (.message.content? // []) | any(.[]?; .type == "tool_result" and (.content | tostring | contains("without explicit repository access"))))',
+        '$EXECUTION_FILE',
+        '>/dev/null',
+        '2>',
+      ],
       [
         'jq',
         '-s',
