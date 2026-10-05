@@ -185,6 +185,11 @@ jobs:
       # Anthropic key and the runner's Actions credentials from every subprocess env
       # and pins the permission mode to `default`. Second line - the agent has no shell.
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
+      # Also read by the CLI: makes every Agent dispatch run in the foreground. A
+      # background agent's result arrives after the turn ends, and this single-shot
+      # process exits at turn end, so the review is never posted. The prompt asks
+      # for synchronous dispatch too, but the model has ignored that in practice.
+      CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'
       # Single source of truth for the run mode. Every fold-gated `if:` and both
       # tool lists read this instead of repeating the input, so a gate added
       # later cannot be twinned wrong. The agent sees it too: the bot-review
@@ -707,9 +712,10 @@ jobs:
         # background review agents, then waits for a completion notification
         # that this single-shot process can never deliver, so the run ends
         # cleanly, well under the turn budget, with nothing posted. The
-        # "Context for automation" block above the review step now tells the
-        # model not to do that; the transcript step below flags a run whose
-        # own history still shows the pattern.
+        # job env's CLAUDE_CODE_DISABLE_BACKGROUND_TASKS now keeps every Agent
+        # dispatch in the foreground, the "Context for automation" block tells
+        # the model not to do it as a second line, and the transcript step
+        # below flags a run whose own history still shows the pattern.
         # FAIL-CLOSED: an API error resolves to "not posted", because the whole
         # point of this step is to never claim a review happened without evidence.
         if: always() && (steps.bot_review.outcome == 'success' || steps.bot_review.outcome == 'failure')
@@ -1255,7 +1261,7 @@ jobs:
           if [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
             echo "::warning::no execution output file to upload"
             echo "uploadable=false" >> "$GITHUB_OUTPUT"
-            echo "schedule_wakeup_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
+            echo "background_wait_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # The redactor reads the skill file to build the strings it strips, so the
@@ -1266,7 +1272,7 @@ jobs:
           if [ -z "$SKILL_SHA" ] || [ "$(sha256sum "$SKILL_FILE" | cut -d' ' -f1)" != "$SKILL_SHA" ]; then
             echo "::warning::the bot-review skill file changed since it was fetched; not uploading a transcript that cannot be redacted against it"
             echo "uploadable=false" >> "$GITHUB_OUTPUT"
-            echo "schedule_wakeup_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
+            echo "background_wait_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # `-I` (isolated) bounds the interpreter, which authenticating the program
@@ -1278,24 +1284,25 @@ jobs:
           if ! python3 -I "$REDACTOR" "$EXECUTION_FILE" "$SKILL_FILE" "$DEST"; then
             echo "::warning::transcript redaction failed; not uploading"
             echo "uploadable=false" >> "$GITHUB_OUTPUT"
-            echo "schedule_wakeup_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
+            echo "background_wait_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "uploadable=true" >> "$GITHUB_OUTPUT"
 
           # Flags the async-wait failure mode: the transcript's own tool-call
-          # history still shows it waiting on a background agent, so "Report
+          # history shows it waiting on a background agent (a ScheduleWakeup call,
+          # or an Agent dispatch the CLI launched async), so "Report
           # incomplete review" can name the likely cause instead of just
           # "errored or ran out of turns". redact-review-transcript.py passes
           # through whichever shape the action gave it (a JSON array, or
           # JSONL) - slurp first and flatten any array-typed element so both
           # shapes land on the same flat list of entries.
           if jq -s -e 'map(if type == "array" then .[] else . end)
-                       | any(.[]; (.message.content? // []) | any(.[]?; .type == "tool_use" and .name == "ScheduleWakeup"))' \
+                       | any(.[]; (.message.content? // []) | any(.[]?; (.type == "tool_use" and .name == "ScheduleWakeup") or (.type == "tool_result" and (.content | tostring | contains("Async agent launched")))))' \
                  "$DEST" >/dev/null 2>&1; then
             WAKEUP=true
           fi
-          echo "schedule_wakeup_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
+          echo "background_wait_detected=$WAKEUP" >> "$GITHUB_OUTPUT"
 
       - name: Upload review transcript
         if: always() && steps.transcript.outputs.uploadable == 'true'
@@ -1332,17 +1339,17 @@ jobs:
         if: always() && !(cancelled() && env.FOLD_MODE == 'true') && (steps.bot_review.outcome == 'failure' || (steps.bot_review.outcome == 'success' && steps.bot_review.outputs.conclusion == 'success')) && steps.review_posted.outputs.posted != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WAKEUP_DETECTED: ${{ steps.transcript.outputs.schedule_wakeup_detected }}
+          BACKGROUND_WAIT_DETECTED: ${{ steps.transcript.outputs.background_wait_detected }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           SERVER_URL: ${{ github.server_url }}
           RUN_ID: ${{ github.run_id }}
         run: |
           BODY="🤖 Automated review did not complete - no review from this run was detected on the PR (the run errored, exhausted its turn budget, or ended without posting). See the [workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for details; a redacted transcript is attached to it as an artifact when one was captured. Re-apply the label to retry, or request a human reviewer."
-          # WAKEUP_DETECTED is set from the uploaded transcript's own tool-call
+          # BACKGROUND_WAIT_DETECTED is set from the uploaded transcript's own tool-call
           # history, so this note is evidence-based, not a guess.
-          if [ "$WAKEUP_DETECTED" = "true" ]; then
-            BODY="$BODY"$'\n\n'"This run's transcript shows it waiting on a background agent via ScheduleWakeup, which nothing in this single-shot process can ever deliver."
+          if [ "$BACKGROUND_WAIT_DETECTED" = "true" ]; then
+            BODY="$BODY"$'\n\n'"This run's transcript shows it waiting on a background agent (an async Agent launch or ScheduleWakeup), whose result this single-shot process can never deliver."
           fi
           # A fold run reaches here with its label already consumed and no fixup: the
           # push is gated on a review being visible, so say that rather than leaving

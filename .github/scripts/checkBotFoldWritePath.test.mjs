@@ -1889,6 +1889,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // bare-token `matchAll` reported the block unchanged.
     expect(mappingEntries(liftBlock(jobs, 'env', 4, 'job env'), 6, 'job env')).toEqual([
       ['CLAUDE_CODE_SUBPROCESS_ENV_SCRUB', "'1'"],
+      ['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', "'1'"],
       ['FOLD_MODE', '${{ inputs.fold_mode }}'],
     ]);
     // POSITIVE CONTROL, on the spelling the old reader could not see. A quoted key is the same
@@ -1908,6 +1909,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     expect(appendedJobKey, 'the job env tail anchor moved').not.toBe(src);
     expect(mappingEntries(liftBlock(appendedJobKey, 'env', 4, 'job env'), 6, 'job env').map(([key]) => key)).toEqual([
       'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB',
+      'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS',
       'FOLD_MODE',
       'BASH_ENV',
     ]);
@@ -2715,7 +2717,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         ['EXECUTION_FILE', 'SKILL_FILE', 'SKILL_SHA', 'REDACTOR', 'DEST', 'PYTHONNOUSERSITE'],
       ],
       ['Upload review transcript', []],
-      ['Report incomplete review', ['GH_TOKEN', 'WAKEUP_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Report incomplete review', ['GH_TOKEN', 'BACKGROUND_WAIT_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skill-fetch failure', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Remove re-review label', ['GH_TOKEN', 'PR', 'REPO', 'LABEL']],
     ]);
@@ -3165,7 +3167,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         '-s',
         '-e',
         'map(if type == "array" then .[] else . end)\n' +
-          '                       | any(.[]; (.message.content? // []) | any(.[]?; .type == "tool_use" and .name == "ScheduleWakeup"))',
+          '                       | any(.[]; (.message.content? // []) | any(.[]?; (.type == "tool_use" and .name == "ScheduleWakeup") or (.type == "tool_result" and (.content | tostring | contains("Async agent launched")))))',
         '$DEST',
         '>/dev/null',
         '2>',
