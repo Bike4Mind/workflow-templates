@@ -712,9 +712,10 @@ jobs:
         # background review agents, then waits for a completion notification
         # that this single-shot process can never deliver, so the run ends
         # cleanly, well under the turn budget, with nothing posted. The
-        # "Context for automation" block above the review step now tells the
-        # model not to do that; the transcript step below flags a run whose
-        # own history still shows the pattern.
+        # job env's CLAUDE_CODE_DISABLE_BACKGROUND_TASKS now keeps every Agent
+        # dispatch in the foreground, the "Context for automation" block tells
+        # the model not to do it as a second line, and the transcript step
+        # below flags a run whose own history still shows the pattern.
         # FAIL-CLOSED: an API error resolves to "not posted", because the whole
         # point of this step is to never claim a review happened without evidence.
         if: always() && (steps.bot_review.outcome == 'success' || steps.bot_review.outcome == 'failure')
