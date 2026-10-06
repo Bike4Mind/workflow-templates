@@ -3082,6 +3082,41 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     }
   });
 
+  it('flags a refused review submission by running its own filter, not only pinning its text', () => {
+    // The refusal arrives as an errored result on a submission tool. A read tool can return the
+    // same text, and a successful submission can quote it, so neither may count.
+    const [, , , program] = commandsNamed(src, /^jq$/)[0];
+    const turn = (name, isError, text = 'Can not request changes on a pull request without explicit repository access') => [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: `t-${name}-${isError}`, name }] } },
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: `t-${name}-${isError}`, is_error: isError, content: text }] },
+      },
+    ];
+    const flags = (...turns) =>
+      spawnSync('jq', ['-s', '-e', program], { input: turns.flat().map(m => JSON.stringify(m)).join('\n'), encoding: 'utf8' })
+        .status === 0;
+    const gh = name => `mcp__github__${name}`;
+
+    expect(flags(turn(gh('submit_pending_pull_request_review'), true))).toBe(true);
+    expect(flags(turn(gh('create_and_submit_pull_request_review'), true))).toBe(true);
+    expect(flags(turn(gh('create_pending_pull_request_review'), true))).toBe(true);
+    expect(flags(turn(gh('submit_pending_pull_request_review'), false))).toBe(false);
+    expect(flags(turn(gh('get_pull_request_reviews'), true))).toBe(false);
+    expect(flags(turn(gh('get_pull_request_review_comments'), true))).toBe(false);
+    // The shape a live refusal took: pending review, inline comment, REQUEST_CHANGES refused,
+    // then the same review resubmitted as COMMENT and accepted.
+    expect(
+      flags(
+        turn(gh('create_pending_pull_request_review'), false, '{"id":1}'),
+        turn(gh('add_comment_to_pending_review'), false, 'ok'),
+        turn(gh('submit_pending_pull_request_review'), true),
+        turn(gh('submit_pending_pull_request_review'), false, 'submitted')
+      )
+    ).toBe(true);
+    expect(flags(turn(gh('create_and_submit_pull_request_review'), false, 'submitted'))).toBe(false);
+  });
+
   it('commits only tracked-file edits, and fails rather than falling through', () => {
     const commands = withoutComments(step(src, 'Push fold commit'));
     // Tracked files only, and pinned as the whole set of staging invocations IN THE FILE
