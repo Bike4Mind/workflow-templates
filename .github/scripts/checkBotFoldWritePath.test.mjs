@@ -1784,6 +1784,63 @@ function runPostedCheck(src        , fixture               )         {
   }
 }
 
+/**
+ * Runs `Report refused review`'s body with `gh` stubbed on PATH, so the real selector runs under
+ * the real jq. Returns the exit status and whether a PR comment was posted.
+ */
+function runRefusedReport(src, fixture) {
+  const bodies = runBodiesRaw(step(src, 'Report refused review'));
+  expect(bodies, 'expected exactly one run: body in the refused-review step').toHaveLength(1);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-refused-'));
+  try {
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(dir, 'reviews.json'),
+      JSON.stringify(
+        (fixture.reviews ?? []).map((review, i) => ({
+          id: `id${i}`,
+          user: { login: review.login ?? BOT_LOGIN },
+          state: review.state,
+          submitted_at: review.at ?? DEFAULT_SINCE,
+        }))
+      )
+    );
+    fs.writeFileSync(
+      path.join(bin, 'gh'),
+      [
+        '#!/bin/sh',
+        'if [ "$1" = pr ]; then echo commented >> "$FIXTURE_DIR/comments"; exit 0; fi',
+        'if [ "$FAKE_GH_STATUS" -ne 0 ]; then echo "api error" >&2; exit "$FAKE_GH_STATUS"; fi',
+        'exec jq -r "$5" < "$FIXTURE_DIR/reviews.json"',
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+    const run = spawnSync('bash', ['-c', bodies[0] ?? ''], {
+      cwd: dir,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+        GH_TOKEN: 'stub',
+        UPLOADABLE: 'true',
+        BOT_REVIEW_LOGIN: BOT_LOGIN,
+        SINCE: fixture.since ?? DEFAULT_SINCE,
+        PR: '1',
+        REPO: 'owner/repo',
+        SERVER_URL: 'https://github.com',
+        RUN_ID: '1',
+        FIXTURE_DIR: dir,
+        FAKE_GH_STATUS: String(fixture.apiStatus ?? 0),
+      },
+    });
+    return { status: run.status, commented: fs.existsSync(path.join(dir, 'comments')), out: run.stdout + run.stderr };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // Several of these EXECUTE the lifted shell against a scratch git repo, so their cost is
 // process spawns rather than CPU. Under a full-package run that is ~10x the isolated wall
 // clock, which put the heaviest one past the 30s default; the headroom is for contention,
@@ -2723,7 +2780,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ],
       ['Upload review transcript', []],
       ['Report incomplete review', ['GH_TOKEN', 'BACKGROUND_WAIT_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
-      ['Report refused review', ['GH_TOKEN', 'UPLOADABLE', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Report refused review', ['GH_TOKEN', 'UPLOADABLE', 'BOT_REVIEW_LOGIN', 'SINCE', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skipped review', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skill-fetch failure', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Remove re-review label', ['GH_TOKEN', 'PR', 'REPO', 'LABEL']],
@@ -3114,6 +3171,31 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     expect(step(src, "Fetch redactor from the calling workflow's own commit")).toContain(
       '::error::could not fetch the transcript redactor'
     );
+  });
+
+  it('reports a refused review unless this run still landed a blocking one', () => {
+    const late = '2099-01-01T00:00:00Z';
+    const early = '2000-01-01T00:00:00Z';
+    const reports = { status: 1, commented: true };
+    const silent = { status: 0, commented: false };
+    const pick = ({ status, commented }) => ({ status, commented });
+
+    // Recovered: the agent resubmitted through the single call and the PR is blocked.
+    expect(pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late }] }))).toEqual(silent);
+    // Fell back to a comment: the case the step exists for.
+    expect(pick(runRefusedReport(src, { reviews: [{ state: 'COMMENTED', at: late }] }))).toEqual(reports);
+    // A blocking review from someone else, or from an earlier run, is not this run's.
+    expect(
+      pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late, login: 'a-human' }] }))
+    ).toEqual(reports);
+    expect(pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: early }] }))).toEqual(reports);
+    // Fail closed: an API error, or no watermark to compare against, still reports.
+    expect(
+      pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late }], apiStatus: 1 }))
+    ).toEqual(reports);
+    expect(
+      pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late }], since: '' }))
+    ).toEqual(reports);
   });
 
   it('flags a refused review submission by running its own filter, not only pinning its text', () => {

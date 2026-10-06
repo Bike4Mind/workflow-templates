@@ -1411,11 +1411,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPLOADABLE: ${{ steps.transcript.outputs.uploadable }}
+          BOT_REVIEW_LOGIN: 'claude[bot]'
+          SINCE: ${{ steps.review_start.outputs.at }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           SERVER_URL: ${{ github.server_url }}
           RUN_ID: ${{ github.run_id }}
         run: |
+          # An agent refused on the pending path can resubmit through the single
+          # call and land a blocking review, which leaves nothing to report. An API
+          # error counts as no such review, so the step still reports.
+          BLOCKING=0
+          if [ -n "$SINCE" ]; then
+            BLOCKING=$(gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+              --jq ".[] | select(.user.login == \"${BOT_REVIEW_LOGIN}\" and .state == \"CHANGES_REQUESTED\" and .submitted_at != null and .submitted_at >= \"${SINCE}\") | .id" \
+              | grep -c . || true)
+          fi
+          if [ "${BLOCKING:-0}" -gt 0 ]; then
+            echo "A blocking review from this run is on the PR, so the refusal was recovered from."
+            exit 0
+          fi
           echo "::error::GitHub refused this run's review submission, so the review on the PR may be non-blocking where the agent asked for changes."
           BODY="🤖 GitHub refused this run's request-changes review, so the review it accepted may be a non-blocking comment. If the review above is a comment, treat any P0/P1 finding in it as blocking. See the [workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})."
           if [ "$UPLOADABLE" = "true" ]; then
