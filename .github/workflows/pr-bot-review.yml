@@ -1202,6 +1202,8 @@ jobs:
         # refused REQUEST_CHANGES and APPROVE from this token "without explicit
         # repository access" while accepting COMMENT, and the agent then falls
         # back. The posted review hides that, so flag it and keep the transcript.
+        # Only results answering a review-submission call count: the phrase also
+        # appears in this file and can appear in any diff or PR text the agent reads.
         if: always() && steps.review_posted.outputs.posted == 'true'
         env:
           EXECUTION_FILE: ${{ steps.bot_review.outputs.execution_file }}
@@ -1213,10 +1215,12 @@ jobs:
           fi
           REFUSED=false
           if jq -s -e 'map(if type == "array" then .[] else . end)
-                       | any(.[]; (.message.content? // []) | any(.[]?; .type == "tool_result" and (.content | tostring | contains("without explicit repository access"))))' \
+                       | [.[] | (.message.content? // []) | .[]?] as $c
+                       | [$c[] | select(.type == "tool_use" and (.name | tostring | contains("pull_request_review"))) | .id] as $ids
+                       | any($c[]; .type == "tool_result" and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))' \
                  "$EXECUTION_FILE" >/dev/null 2>&1; then
             REFUSED=true
-            echo "::warning::GitHub refused a review submission in this run, so the posted review may be weaker than the one the agent chose. Keeping the redacted transcript."
+            echo "::warning::A review-submission tool result in this run matched GitHub's refusal text, so the posted review may be weaker than the one the agent chose. Keeping the redacted transcript."
           fi
           echo "refused=$REFUSED" >> "$GITHUB_OUTPUT"
 

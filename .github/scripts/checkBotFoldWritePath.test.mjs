@@ -3171,7 +3171,9 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         '-s',
         '-e',
         'map(if type == "array" then .[] else . end)\n' +
-          '                       | any(.[]; (.message.content? // []) | any(.[]?; .type == "tool_result" and (.content | tostring | contains("without explicit repository access"))))',
+          '                       | [.[] | (.message.content? // []) | .[]?] as $c\n' +
+          '                       | [$c[] | select(.type == "tool_use" and (.name | tostring | contains("pull_request_review"))) | .id] as $ids\n' +
+          '                       | any($c[]; .type == "tool_result" and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))',
         '$EXECUTION_FILE',
         '>/dev/null',
         '2>',
