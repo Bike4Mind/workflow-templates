@@ -1784,6 +1784,63 @@ function runPostedCheck(src        , fixture               )         {
   }
 }
 
+/**
+ * Runs `Report refused review`'s body with `gh` stubbed on PATH, so the real selector runs under
+ * the real jq. Returns the exit status and whether a PR comment was posted.
+ */
+function runRefusedReport(src, fixture) {
+  const bodies = runBodiesRaw(step(src, 'Report refused review'));
+  expect(bodies, 'expected exactly one run: body in the refused-review step').toHaveLength(1);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-refused-'));
+  try {
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(dir, 'reviews.json'),
+      JSON.stringify(
+        (fixture.reviews ?? []).map((review, i) => ({
+          id: `id${i}`,
+          user: { login: review.login ?? BOT_LOGIN },
+          state: review.state,
+          submitted_at: review.at ?? DEFAULT_SINCE,
+        }))
+      )
+    );
+    fs.writeFileSync(
+      path.join(bin, 'gh'),
+      [
+        '#!/bin/sh',
+        'if [ "$1" = pr ]; then echo commented >> "$FIXTURE_DIR/comments"; exit 0; fi',
+        'if [ "$FAKE_GH_STATUS" -ne 0 ]; then echo "api error" >&2; exit "$FAKE_GH_STATUS"; fi',
+        'exec jq -r "$5" < "$FIXTURE_DIR/reviews.json"',
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+    const run = spawnSync('bash', ['-c', bodies[0] ?? ''], {
+      cwd: dir,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+        GH_TOKEN: 'stub',
+        UPLOADABLE: 'true',
+        BOT_REVIEW_LOGIN: BOT_LOGIN,
+        SINCE: fixture.since ?? DEFAULT_SINCE,
+        PR: '1',
+        REPO: 'owner/repo',
+        SERVER_URL: 'https://github.com',
+        RUN_ID: '1',
+        FIXTURE_DIR: dir,
+        FAKE_GH_STATUS: String(fixture.apiStatus ?? 0),
+      },
+    });
+    return { status: run.status, commented: fs.existsSync(path.join(dir, 'comments')), out: run.stdout + run.stderr };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // Several of these EXECUTE the lifted shell against a scratch git repo, so their cost is
 // process spawns rather than CPU. Under a full-package run that is ~10x the isolated wall
 // clock, which put the heaviest one past the 30s default; the headroom is for contention,
@@ -2680,6 +2737,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Redact and upload review transcript',
       'Upload review transcript',
       'Report incomplete review',
+      'Report refused review',
       'Report skipped review',
       'Report skill-fetch failure',
       'Remove re-review label',
@@ -2722,6 +2780,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ],
       ['Upload review transcript', []],
       ['Report incomplete review', ['GH_TOKEN', 'BACKGROUND_WAIT_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Report refused review', ['GH_TOKEN', 'UPLOADABLE', 'BOT_REVIEW_LOGIN', 'SINCE', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skipped review', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skill-fetch failure', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Remove re-review label', ['GH_TOKEN', 'PR', 'REPO', 'LABEL']],
@@ -2777,7 +2836,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       );
       const label = injected.split('\n')[0];
       expect(mutated, 'the step injection anchor moved').not.toBe(src);
-      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(24);
+      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(25);
       if (unnamed) expect(stepNames(mutated), `a name-less step was not seen: ${label}`).toContain(UNNAMED_STEP);
     }
   });
@@ -3080,6 +3139,63 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skill-fetch failure']);
       }
     }
+
+    // `Report refused review` reports the VERDICT, not the run, so it sits outside `reporters`:
+    // beside a fold reporter it is a second, non-contradictory comment. It must still fire on
+    // every posted refusal except the cancelled fold, and never beside a reporter that says the
+    // review did not happen.
+    expect(ifLine(src, 'Report refused review')).toBe(
+      "always() && !(cancelled() && env.FOLD_MODE == 'true') && steps.review_posted.outputs.posted == 'true' && steps.review_refused.outputs.refused == 'true'"
+    );
+    const runFailed = ['Report cancelled fold', 'Report incomplete review', 'Report skipped review', 'Report skill-fetch failure'];
+    for (const cancelled of [false, true]) {
+      for (const foldMode of [false, true]) {
+        for (const posted of [false, true]) {
+          for (const minted of [false, true]) {
+            for (const pushed of [false, true]) {
+              for (const refused of [false, true]) {
+                const s = state(cancelled, foldMode, posted, minted, pushed);
+                s.steps.review_refused = { outcome: 'success', outputs: { refused: refused ? 'true' : 'false' } };
+                const cell = `cancelled=${cancelled} fold=${foldMode} posted=${posted} minted=${minted} pushed=${pushed} refused=${refused}`;
+                const fires = stepFires(src, 'Report refused review', s);
+                expect(fires, cell).toBe(refused && posted && !(cancelled && foldMode));
+                if (fires) expect(firing(s).filter(name => runFailed.includes(name)), cell).toEqual([]);
+              }
+            }
+          }
+        }
+      }
+    }
+    // Red, and after the comment: a green check is what made a refused review silent.
+    expect(step(src, 'Report refused review').trimEnd()).toMatch(/\n {10}exit 1$/);
+    expect(step(src, "Fetch redactor from the calling workflow's own commit")).toContain(
+      '::error::could not fetch the transcript redactor'
+    );
+  });
+
+  it('reports a refused review unless this run still landed a blocking one', () => {
+    const late = '2099-01-01T00:00:00Z';
+    const early = '2000-01-01T00:00:00Z';
+    const reports = { status: 1, commented: true };
+    const silent = { status: 0, commented: false };
+    const pick = ({ status, commented }) => ({ status, commented });
+
+    // Recovered: the agent resubmitted through the single call and the PR is blocked.
+    expect(pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late }] }))).toEqual(silent);
+    // Fell back to a comment: the case the step exists for.
+    expect(pick(runRefusedReport(src, { reviews: [{ state: 'COMMENTED', at: late }] }))).toEqual(reports);
+    // A blocking review from someone else, or from an earlier run, is not this run's.
+    expect(
+      pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late, login: 'a-human' }] }))
+    ).toEqual(reports);
+    expect(pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: early }] }))).toEqual(reports);
+    // Fail closed: an API error, or no watermark to compare against, still reports.
+    expect(
+      pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late }], apiStatus: 1 }))
+    ).toEqual(reports);
+    expect(
+      pick(runRefusedReport(src, { reviews: [{ state: 'CHANGES_REQUESTED', at: late }], since: '' }))
+    ).toEqual(reports);
   });
 
   it('flags a refused review submission by running its own filter, not only pinning its text', () => {
@@ -3612,7 +3728,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     const edited = runPushStep(src, { edits: [{ path: 'src/a.ts', lines: 4 }], untracked: ['src/dropped.ts'] });
     expect(edited.status, edited.out).toBe(0);
     expect(edited.pushed).toEqual(['true']);
-    expect(edited.remoteLog[0]).toBe('chore(bot-fold): apply review findings from the automated review');
+    expect(edited.remoteLog[0]).toBe('chore(bot-review-fold): apply review findings from the automated review');
     // The COMMIT's contents, not the index the guard read. This is the assertion a
     // working-tree write plus `commit -a` fails, and the one that makes `git add -u`'s
     // tracked-files-only bound behavioural: the dropped untracked file is not here.
