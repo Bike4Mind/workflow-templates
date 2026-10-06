@@ -2680,6 +2680,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Redact and upload review transcript',
       'Upload review transcript',
       'Report incomplete review',
+      'Report skipped review',
       'Report skill-fetch failure',
       'Remove re-review label',
     ]);
@@ -2721,6 +2722,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ],
       ['Upload review transcript', []],
       ['Report incomplete review', ['GH_TOKEN', 'BACKGROUND_WAIT_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Report skipped review', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skill-fetch failure', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Remove re-review label', ['GH_TOKEN', 'PR', 'REPO', 'LABEL']],
     ]);
@@ -2775,7 +2777,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       );
       const label = injected.split('\n')[0];
       expect(mutated, 'the step injection anchor moved').not.toBe(src);
-      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(23);
+      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(24);
       if (unnamed) expect(stepNames(mutated), `a name-less step was not seen: ${label}`).toContain(UNNAMED_STEP);
     }
   });
@@ -2951,6 +2953,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Report cancelled fold',
       'Report fold no-op',
       'Report incomplete review',
+      'Report skipped review',
       'Report skill-fetch failure',
     ];
     // `bot_review` is held at the shape claude-code-action leaves on a successful review and
@@ -3010,6 +3013,18 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     expect(firing(state(false, true, false, true, true))).toEqual(['Report incomplete review']);
     expect(firing(state(false, true, true, false, true))).toEqual(['Report fold failure']);
     expect(firing(state(false, true, true, true, false))).toEqual(['Report fold failure']);
+    // The action's workflow-validation no-op exits 0 with `conclusion` unset, which Actions
+    // reads as ''. It used to match no reporter, leaving a green check and no review.
+    for (const cancelled of [false, true]) {
+      for (const foldMode of [false, true]) {
+        const skipped = state(cancelled, foldMode, false, false, false);
+        skipped.steps.bot_review = { outcome: 'success', outputs: { conclusion: '' } };
+        expect(
+          firing(skipped),
+          `a validation skip was outside the sweep: cancelled=${cancelled} fold=${foldMode}`
+        ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skipped review']);
+      }
+    }
     // The happy path is the one tuple in each mode that correctly comments nothing.
     expect(firing(state(false, true, true, true, true))).toEqual([]);
     expect(firing(state(false, false, true, true, true))).toEqual([]);
@@ -3172,8 +3187,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         '-e',
         'map(if type == "array" then .[] else . end)\n' +
           '                       | [.[] | (.message.content? // []) | .[]?] as $c\n' +
-          '                       | [$c[] | select(.type == "tool_use" and (.name | tostring | contains("pull_request_review"))) | .id] as $ids\n' +
-          '                       | any($c[]; .type == "tool_result" and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))',
+          '                       | [$c[] | select(.type == "tool_use" and ((.name | tostring) as $n | ["mcp__github__create_and_submit_pull_request_review", "mcp__github__create_pending_pull_request_review", "mcp__github__submit_pending_pull_request_review"] | any(. == $n))) | .id] as $ids\n' +
+          '                       | any($c[]; .type == "tool_result" and .is_error == true and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))',
         '$EXECUTION_FILE',
         '>/dev/null',
         '2>',

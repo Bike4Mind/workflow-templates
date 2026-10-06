@@ -789,8 +789,7 @@ jobs:
         # review` below comments on most `posted != 'true'` runs. The one path it
         # deliberately excludes is the claude-code-action no-op that fires when the
         # CALLER's workflow file differs from the default-branch copy
-        # (`conclusion != 'success'`): that consumes the label with no review and no
-        # comment. Every PR editing the caller stub or this reusable is on it.
+        # (`conclusion != 'success'`). `Report skipped review` comments on that one.
         if: |
           !cancelled() && env.FOLD_MODE == 'true' &&
           steps.bot_review.outcome == 'success' &&
@@ -1204,11 +1203,12 @@ jobs:
 
       - name: Detect a refused review submission
         id: review_refused
-        # A review can post in a weaker state than the agent chose. GitHub has
-        # refused REQUEST_CHANGES and APPROVE from this token "without explicit
-        # repository access" while accepting COMMENT, and the agent then falls
-        # back. The posted review hides that, so flag it and keep the transcript.
-        # Only results answering a review-submission call count: the phrase also
+        # A review can post in a weaker state than the agent chose. GitHub refuses
+        # REQUEST_CHANGES "without explicit repository access" when this token
+        # submits a pending review, while accepting COMMENT, and the agent then
+        # falls back. The prompt routes REQUEST_CHANGES through the single-call
+        # tool to avoid that; this catches a run that takes the pending path anyway.
+        # Only an errored result answering a submission call counts: the phrase also
         # appears in this file and can appear in any diff or PR text the agent reads.
         if: always() && steps.review_posted.outputs.posted == 'true'
         env:
@@ -1222,8 +1222,8 @@ jobs:
           REFUSED=false
           if jq -s -e 'map(if type == "array" then .[] else . end)
                        | [.[] | (.message.content? // []) | .[]?] as $c
-                       | [$c[] | select(.type == "tool_use" and (.name | tostring | contains("pull_request_review"))) | .id] as $ids
-                       | any($c[]; .type == "tool_result" and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))' \
+                       | [$c[] | select(.type == "tool_use" and ((.name | tostring) as $n | ["mcp__github__create_and_submit_pull_request_review", "mcp__github__create_pending_pull_request_review", "mcp__github__submit_pending_pull_request_review"] | any(. == $n))) | .id] as $ids
+                       | any($c[]; .type == "tool_result" and .is_error == true and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))' \
                  "$EXECUTION_FILE" >/dev/null 2>&1; then
             REFUSED=true
             echo "::warning::A review-submission tool result in this run matched GitHub's refusal text, so the posted review may be weaker than the one the agent chose. Keeping the redacted transcript."
@@ -1397,6 +1397,27 @@ jobs:
             --body "$BODY"
           # Red the job too. A success-with-no-post used to leave a green check,
           # which reads as "the review happened" - the failure mode this guards.
+          exit 1
+
+      - name: Report skipped review
+        # The complement of `Report incomplete review`'s success branch: the action
+        # exited 0 without ever setting `conclusion`. Its documented cause is the
+        # workflow-validation no-op, where the CALLER's workflow file differs from
+        # the default-branch copy, so every PR that edits the caller stub (a pin
+        # bump included) lands here. Red, because the review that was asked for did
+        # not happen, and a green check reads as though it did.
+        if: always() && !(cancelled() && env.FOLD_MODE == 'true') && steps.bot_review.outcome == 'success' && steps.bot_review.outputs.conclusion == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "::error::claude-code-action exited without running the review. The usual cause is that this PR changes the workflow file that calls bot-review, and the action only runs a copy identical to the default branch's."
+          gh pr comment "$PR" \
+            --repo "$REPO" \
+            --body "🤖 bot-review did not run on this PR. The review action exited without starting, which it does when this PR changes the workflow file that calls bot-review (the action only runs a copy identical to the default branch's). Request a human reviewer, or re-apply the label once that change is on the default branch. See the [workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})." || true
           exit 1
 
       - name: Report skill-fetch failure
