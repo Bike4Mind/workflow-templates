@@ -2680,6 +2680,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Redact and upload review transcript',
       'Upload review transcript',
       'Report incomplete review',
+      'Report skipped review',
       'Report skill-fetch failure',
       'Remove re-review label',
     ]);
@@ -2721,6 +2722,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ],
       ['Upload review transcript', []],
       ['Report incomplete review', ['GH_TOKEN', 'BACKGROUND_WAIT_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Report skipped review', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skill-fetch failure', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Remove re-review label', ['GH_TOKEN', 'PR', 'REPO', 'LABEL']],
     ]);
@@ -2775,7 +2777,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       );
       const label = injected.split('\n')[0];
       expect(mutated, 'the step injection anchor moved').not.toBe(src);
-      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(23);
+      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(24);
       if (unnamed) expect(stepNames(mutated), `a name-less step was not seen: ${label}`).toContain(UNNAMED_STEP);
     }
   });
@@ -2951,6 +2953,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Report cancelled fold',
       'Report fold no-op',
       'Report incomplete review',
+      'Report skipped review',
       'Report skill-fetch failure',
     ];
     // `bot_review` is held at the shape claude-code-action leaves on a successful review and
@@ -3010,6 +3013,18 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     expect(firing(state(false, true, false, true, true))).toEqual(['Report incomplete review']);
     expect(firing(state(false, true, true, false, true))).toEqual(['Report fold failure']);
     expect(firing(state(false, true, true, true, false))).toEqual(['Report fold failure']);
+    // The action's workflow-validation no-op exits 0 with `conclusion` unset, which Actions
+    // reads as ''. It used to match no reporter, leaving a green check and no review.
+    for (const cancelled of [false, true]) {
+      for (const foldMode of [false, true]) {
+        const skipped = state(cancelled, foldMode, false, false, false);
+        skipped.steps.bot_review = { outcome: 'success', outputs: { conclusion: '' } };
+        expect(
+          firing(skipped),
+          `a validation skip was outside the sweep: cancelled=${cancelled} fold=${foldMode}`
+        ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skipped review']);
+      }
+    }
     // The happy path is the one tuple in each mode that correctly comments nothing.
     expect(firing(state(false, true, true, true, true))).toEqual([]);
     expect(firing(state(false, false, true, true, true))).toEqual([]);
@@ -3065,6 +3080,41 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skill-fetch failure']);
       }
     }
+  });
+
+  it('flags a refused review submission by running its own filter, not only pinning its text', () => {
+    // The refusal arrives as an errored result on a submission tool. A read tool can return the
+    // same text, and a successful submission can quote it, so neither may count.
+    const [, , , program] = commandsNamed(src, /^jq$/)[0];
+    const turn = (name, isError, text = 'Can not request changes on a pull request without explicit repository access') => [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: `t-${name}-${isError}`, name }] } },
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: `t-${name}-${isError}`, is_error: isError, content: text }] },
+      },
+    ];
+    const flags = (...turns) =>
+      spawnSync('jq', ['-s', '-e', program], { input: turns.flat().map(m => JSON.stringify(m)).join('\n'), encoding: 'utf8' })
+        .status === 0;
+    const gh = name => `mcp__github__${name}`;
+
+    expect(flags(turn(gh('submit_pending_pull_request_review'), true))).toBe(true);
+    expect(flags(turn(gh('create_and_submit_pull_request_review'), true))).toBe(true);
+    expect(flags(turn(gh('create_pending_pull_request_review'), true))).toBe(true);
+    expect(flags(turn(gh('submit_pending_pull_request_review'), false))).toBe(false);
+    expect(flags(turn(gh('get_pull_request_reviews'), true))).toBe(false);
+    expect(flags(turn(gh('get_pull_request_review_comments'), true))).toBe(false);
+    // The shape a live refusal took: pending review, inline comment, REQUEST_CHANGES refused,
+    // then the same review resubmitted as COMMENT and accepted.
+    expect(
+      flags(
+        turn(gh('create_pending_pull_request_review'), false, '{"id":1}'),
+        turn(gh('add_comment_to_pending_review'), false, 'ok'),
+        turn(gh('submit_pending_pull_request_review'), true),
+        turn(gh('submit_pending_pull_request_review'), false, 'submitted')
+      )
+    ).toBe(true);
+    expect(flags(turn(gh('create_and_submit_pull_request_review'), false, 'submitted'))).toBe(false);
   });
 
   it('commits only tracked-file edits, and fails rather than falling through', () => {
@@ -3172,8 +3222,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         '-e',
         'map(if type == "array" then .[] else . end)\n' +
           '                       | [.[] | (.message.content? // []) | .[]?] as $c\n' +
-          '                       | [$c[] | select(.type == "tool_use" and (.name | tostring | contains("pull_request_review"))) | .id] as $ids\n' +
-          '                       | any($c[]; .type == "tool_result" and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))',
+          '                       | [$c[] | select(.type == "tool_use" and ((.name | tostring) as $n | ["mcp__github__create_and_submit_pull_request_review", "mcp__github__create_pending_pull_request_review", "mcp__github__submit_pending_pull_request_review"] | any(. == $n))) | .id] as $ids\n' +
+          '                       | any($c[]; .type == "tool_result" and .is_error == true and (.tool_use_id as $t | $ids | any(. == $t)) and (.content | tostring | contains("without explicit repository access")))',
         '$EXECUTION_FILE',
         '>/dev/null',
         '2>',
