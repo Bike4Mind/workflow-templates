@@ -928,7 +928,7 @@ jobs:
           # label click. An allowlist would not help; "paths a fold may legitimately
           # edit" and "paths CI runs" are the same set here. The bounds that do apply
           # to that residual are the label gate, the size bound below, and the fact
-          # that a fold leaves a public review and a visible `chore(bot-fold)` commit
+          # that a fold leaves a public review and a visible `chore(bot-review-fold)` commit
           # behind it.
           #
           # Nothing here is committed unless every staged path is outside the denied
@@ -1068,7 +1068,7 @@ jobs:
           git -c user.name='claude[bot]' \
               -c user.email='claude[bot]@users.noreply.github.com' \
               commit --no-verify --no-gpg-sign \
-            -m 'chore(bot-fold): apply review findings from the automated review' \
+            -m 'chore(bot-review-fold): apply review findings from the automated review' \
             -m "Applied by pr-bot-review in fold mode. The review posted on this PR says which findings were applied and which were left." \
             -m "Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
 
@@ -1255,13 +1255,14 @@ jobs:
           set -uo pipefail
           # Fail SOFT: this whole transcript feature is a best-effort debugging aid,
           # not a record, so a transient API hiccup fetching the redactor itself must
-          # not redden the job on top of whatever "Report incomplete review" already
-          # reports. `fetched=false` makes the next step skip cleanly instead.
+          # not redden the job on top of whatever "Report incomplete review" or
+          # "Report refused review" already reports; both name a missing transcript.
+          # `fetched=false` makes the next step skip cleanly instead.
           if gh api "repos/${WORKFLOW_REPO}/contents/.github/scripts/redact-review-transcript.py?ref=${WORKFLOW_SHA}" \
                --jq '.content' | base64 -d > "$DEST" && [ -s "$DEST" ]; then
             echo "fetched=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::could not fetch the transcript redactor; not uploading a transcript"
+            echo "::error::could not fetch the transcript redactor; not uploading a transcript"
             echo "fetched=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -1397,6 +1398,35 @@ jobs:
             --body "$BODY"
           # Red the job too. A success-with-no-post used to leave a green check,
           # which reads as "the review happened" - the failure mode this guards.
+          exit 1
+
+      - name: Report refused review
+        # A posted review that GitHub took in a weaker state than the agent chose:
+        # REQUEST_CHANGES refused, the same findings accepted as a non-blocking
+        # COMMENT. The check would otherwise be green and the PR mergeable over P0/P1
+        # findings, so say so on the PR and red the job. `posted == 'true'` keeps it
+        # off every state `Report incomplete review` owns. It can comment beside a
+        # fold reporter: those report the fixup, this reports the verdict.
+        if: always() && !(cancelled() && env.FOLD_MODE == 'true') && steps.review_posted.outputs.posted == 'true' && steps.review_refused.outputs.refused == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOADABLE: ${{ steps.transcript.outputs.uploadable }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "::error::GitHub refused this run's review submission, so the review on the PR may be non-blocking where the agent asked for changes."
+          BODY="🤖 GitHub refused this run's request-changes review, so the review it accepted may be a non-blocking comment. If the review above is a comment, treat any P0/P1 finding in it as blocking. See the [workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})."
+          if [ "$UPLOADABLE" = "true" ]; then
+            BODY="$BODY A redacted transcript is attached to the run as an artifact."
+          else
+            echo "::error::no transcript was captured for this refused review"
+            BODY="$BODY No transcript could be captured for this run."
+          fi
+          gh pr comment "$PR" \
+            --repo "$REPO" \
+            --body "$BODY" || true
           exit 1
 
       - name: Report skipped review

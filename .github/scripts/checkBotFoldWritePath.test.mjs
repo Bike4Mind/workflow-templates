@@ -2680,6 +2680,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Redact and upload review transcript',
       'Upload review transcript',
       'Report incomplete review',
+      'Report refused review',
       'Report skipped review',
       'Report skill-fetch failure',
       'Remove re-review label',
@@ -2722,6 +2723,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ],
       ['Upload review transcript', []],
       ['Report incomplete review', ['GH_TOKEN', 'BACKGROUND_WAIT_DETECTED', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
+      ['Report refused review', ['GH_TOKEN', 'UPLOADABLE', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skipped review', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Report skill-fetch failure', ['GH_TOKEN', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
       ['Remove re-review label', ['GH_TOKEN', 'PR', 'REPO', 'LABEL']],
@@ -2777,7 +2779,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       );
       const label = injected.split('\n')[0];
       expect(mutated, 'the step injection anchor moved').not.toBe(src);
-      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(24);
+      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(25);
       if (unnamed) expect(stepNames(mutated), `a name-less step was not seen: ${label}`).toContain(UNNAMED_STEP);
     }
   });
@@ -3080,6 +3082,38 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         ).toEqual([cancelled && foldMode ? 'Report cancelled fold' : 'Report skill-fetch failure']);
       }
     }
+
+    // `Report refused review` reports the VERDICT, not the run, so it sits outside `reporters`:
+    // beside a fold reporter it is a second, non-contradictory comment. It must still fire on
+    // every posted refusal except the cancelled fold, and never beside a reporter that says the
+    // review did not happen.
+    expect(ifLine(src, 'Report refused review')).toBe(
+      "always() && !(cancelled() && env.FOLD_MODE == 'true') && steps.review_posted.outputs.posted == 'true' && steps.review_refused.outputs.refused == 'true'"
+    );
+    const runFailed = ['Report cancelled fold', 'Report incomplete review', 'Report skipped review', 'Report skill-fetch failure'];
+    for (const cancelled of [false, true]) {
+      for (const foldMode of [false, true]) {
+        for (const posted of [false, true]) {
+          for (const minted of [false, true]) {
+            for (const pushed of [false, true]) {
+              for (const refused of [false, true]) {
+                const s = state(cancelled, foldMode, posted, minted, pushed);
+                s.steps.review_refused = { outcome: 'success', outputs: { refused: refused ? 'true' : 'false' } };
+                const cell = `cancelled=${cancelled} fold=${foldMode} posted=${posted} minted=${minted} pushed=${pushed} refused=${refused}`;
+                const fires = stepFires(src, 'Report refused review', s);
+                expect(fires, cell).toBe(refused && posted && !(cancelled && foldMode));
+                if (fires) expect(firing(s).filter(name => runFailed.includes(name)), cell).toEqual([]);
+              }
+            }
+          }
+        }
+      }
+    }
+    // Red, and after the comment: a green check is what made a refused review silent.
+    expect(step(src, 'Report refused review').trimEnd()).toMatch(/\n {10}exit 1$/);
+    expect(step(src, "Fetch redactor from the calling workflow's own commit")).toContain(
+      '::error::could not fetch the transcript redactor'
+    );
   });
 
   it('flags a refused review submission by running its own filter, not only pinning its text', () => {
@@ -3612,7 +3646,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     const edited = runPushStep(src, { edits: [{ path: 'src/a.ts', lines: 4 }], untracked: ['src/dropped.ts'] });
     expect(edited.status, edited.out).toBe(0);
     expect(edited.pushed).toEqual(['true']);
-    expect(edited.remoteLog[0]).toBe('chore(bot-fold): apply review findings from the automated review');
+    expect(edited.remoteLog[0]).toBe('chore(bot-review-fold): apply review findings from the automated review');
     // The COMMIT's contents, not the index the guard read. This is the assertion a
     // working-tree write plus `commit -a` fails, and the one that makes `git add -u`'s
     // tracked-files-only bound behavioural: the dropped untracked file is not here.
