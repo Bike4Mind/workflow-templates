@@ -160,6 +160,29 @@ on:
           paths.
         type: string
         default: ubuntu-latest
+      anthropic_federation_rule_id:
+        description: >-
+          Workload identity federation rule (fdrl_...). When set, the review
+          authenticates by exchanging the job's GitHub OIDC token and the
+          caller's ANTHROPIC_API_KEY secret is not passed to the action. Needs
+          `id-token: write` in the caller's permissions block, and
+          anthropic_organization_id alongside it. Empty keeps the API key path.
+        type: string
+        default: ''
+      anthropic_organization_id:
+        description: Anthropic organization UUID for federation. Not a secret.
+        type: string
+        default: ''
+      anthropic_service_account_id:
+        description: Federation service account (svac_...). Not a secret.
+        type: string
+        default: ''
+      anthropic_workspace_id:
+        description: >-
+          Federation workspace (wrkspc_...). Optional when the rule targets a
+          single workspace. Not a secret.
+        type: string
+        default: ''
 
 jobs:
   review:
@@ -431,7 +454,12 @@ jobs:
         if: steps.size_check.outputs.skip == 'false' && steps.substantive.outputs.skip != 'true' && steps.skill_fetch.outcome == 'success'
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Exactly one credential reaches the action: a federation rule suppresses the key.
+          anthropic_api_key: ${{ inputs.anthropic_federation_rule_id == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          anthropic_federation_rule_id: ${{ inputs.anthropic_federation_rule_id }}
+          anthropic_organization_id: ${{ inputs.anthropic_organization_id }}
+          anthropic_service_account_id: ${{ inputs.anthropic_service_account_id }}
+          anthropic_workspace_id: ${{ inputs.anthropic_workspace_id }}
           prompt: |
             You are running in GitHub Actions to auto-review PR
             #${{ github.event.pull_request.number }} in ${{ github.repository }}.
@@ -705,7 +733,7 @@ jobs:
             # ScheduleWakeup makes sense only in an interactive session; this
             # process is single-shot, so hard-block the tool call itself
             # rather than relying on the prompt bullet above alone.
-            --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),Edit(//home/runner/.*),Edit(//home/runner/.*/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**)' }}"
+            --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),Edit(//home/runner/.*),Edit(//home/runner/.*/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**)' }}"
             --max-turns ${{ inputs.max_turns }}
 
       - name: Verify a review was actually posted
