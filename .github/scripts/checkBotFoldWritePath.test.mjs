@@ -2099,7 +2099,13 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // `Edit(` was asserted by neither the set above nor this, so appending one to either arm
     // was invisible - and appending `Read(/dev/null)" --settings ./ci-settings.json "` put
     // `--settings` on the real CLI's argv while reading as one more hardening deny.
-    const reads = ['Read(.git/**)', 'Read(//proc/**)', 'Read(//sys/**)'];
+    const reads = [
+      'Read(.git/**)',
+      'Read(//proc/**)',
+      'Read(//sys/**)',
+      // The federated path writes its OIDC token here; keep the agent from reading it.
+      'Read(/${{ runner.temp }}/claude-workload-identity/**)',
+    ];
     expect(pathSpecs.filter(spec => !spec.startsWith('Edit(')).sort()).toEqual([...reads].sort());
     // The step's own comment says both branches are spelled out in full by design, so every
     // edit here is a both-arms edit, and a fold-arm-only assertion waves the review arm through.
@@ -2132,7 +2138,17 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // deliberate edit here, which is where the question "does this reach execution?" gets
     // asked.
     expect(step(src, 'Run /bot-review')).toMatch(/^ {8}uses: anthropics\/claude-code-action@v1$/m);
-    expect(withKeys(src, 'Run /bot-review').sort()).toEqual(['anthropic_api_key', 'claude_args', 'prompt']);
+    // The four federation keys never reach execution: upstream declares them as inputs and
+    // exports them only as ANTHROPIC_* env vars on the main step, for the OIDC token exchange.
+    expect(withKeys(src, 'Run /bot-review').sort()).toEqual([
+      'anthropic_api_key',
+      'anthropic_federation_rule_id',
+      'anthropic_organization_id',
+      'anthropic_service_account_id',
+      'anthropic_workspace_id',
+      'claude_args',
+      'prompt',
+    ]);
     // POSITIVE CONTROL, on the spelling a bare-token reader cannot see. `"settings"` is the same
     // input to the action as `settings` is, and `settings` is the one that writes
     // `$HOME/.claude/settings.json` with its `hooks` block - so a quoted spelling that the pin
