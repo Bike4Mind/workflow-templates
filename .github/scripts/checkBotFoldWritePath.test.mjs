@@ -2047,9 +2047,12 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       .sort();
     const prompt = src.match(/^ {10}prompt: \|\n([\s\S]*?)^ {10}claude_args:/m)?.[1];
     if (!prompt) throw new Error('no prompt: block before claude_args:');
-    const named = [
-      ...new Set(prompt.match(/\b(?:get|list|create|add|submit|delete|update|search)_[a-z_]+\b/g) ?? []),
-    ].sort();
+    // Tool-shaped tokens: a GitHub MCP verb prefix, or the server's newer `<noun>_read`/`_write`
+    // form. Prose like `pull_request` matches neither, so a name the prompt uses that is not on
+    // this list slips through; extend it when the server grows a verb.
+    const toolName =
+      /\b(?:(?:get|list|create|add|submit|delete|update|search|merge|request|push|fork|assign|dismiss|mark|manage|run|rerun|cancel|download|star|unstar)_[a-z_]+|[a-z_]+_(?:read|write))\b/g;
+    const named = [...new Set(prompt.match(toolName) ?? [])].sort();
     expect(allowed.length).toBeGreaterThan(0);
     expect(named).toEqual(allowed);
   });
@@ -2137,8 +2140,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // that decides, so a subtraction here is a widening and has to be a deliberate edit.
     // `MultiEdit` and `NotebookEdit` are names this CLI does not know, so they deny nothing
     // today; they are kept because a rename is what would make them live and the cost is nil.
-    // The same goes for the process-control names after them: the current names and the ones
-    // they replaced are both listed, because `@v1` floats and an unknown name costs nothing.
+    // The same goes for the execution and work-launching names after them: the current names and
+    // the ones they replaced are both listed, because `@v1` floats and an unknown name costs nothing.
     const plain = [
       'Bash',
       'MultiEdit',

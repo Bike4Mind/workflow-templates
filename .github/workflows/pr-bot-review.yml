@@ -737,11 +737,12 @@ jobs:
             # rather than relying on the prompt bullet above alone.
             #
             # The names after it are every other tool that runs a command or a
-            # process, or launches work outside this turn: current names and the
-            # ones they replaced (BashOutput/KillShell/KillBash became TaskOutput/
-            # TaskStop), plus PowerShell, Monitor, REPL and Tmux. An unknown name costs
-            # a startup warning, like MultiEdit. --allowedTools is still the real
-            # fence; this only keeps a future widening of it from granting these.
+            # process: current names and the ones they replaced (BashOutput/KillShell/
+            # KillBash became TaskOutput/TaskStop), plus PowerShell, Monitor, REPL and
+            # Tmux. Workflow, RemoteTrigger and CronCreate launch work outside this
+            # turn, and EnterWorktree writes a worktree. An unknown name costs a
+            # startup warning, like MultiEdit. --allowedTools is still the real fence;
+            # this only keeps a future widening of it from granting these.
             --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),Edit(//home/runner/.*),Edit(//home/runner/.*/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,PowerShell,Monitor,REPL,Tmux,Workflow,RemoteTrigger,CronCreate,EnterWorktree,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,PowerShell,Monitor,REPL,Tmux,Workflow,RemoteTrigger,CronCreate,EnterWorktree,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**)' }}"
             --max-turns ${{ inputs.max_turns }}
 
