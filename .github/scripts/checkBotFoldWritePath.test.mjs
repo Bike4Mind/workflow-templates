@@ -2036,6 +2036,27 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     expect(allow.fold.filter(tool => !allow.review.includes(tool)).sort()).toEqual(['Edit', 'Write']);
   });
 
+  it('names every allowed GitHub tool in the prompt, and only those', () => {
+    // The prompt tells the agent which GitHub tool does what, by bare name. A tool allowed but
+    // never named is one the agent has to guess at, and one named but not allowed is a call that
+    // fails mid-review, so the two lists must move together.
+    const allow = toolListModes(toolFlagValues(src, 'allowedTools')[0]);
+    const allowed = allow.review
+      .filter(tool => tool.startsWith('mcp__github__'))
+      .map(tool => tool.slice('mcp__github__'.length))
+      .sort();
+    const prompt = src.match(/^ {10}prompt: \|\n([\s\S]*?)^ {10}claude_args:/m)?.[1];
+    if (!prompt) throw new Error('no prompt: block before claude_args:');
+    // Tool-shaped tokens: a GitHub MCP verb prefix, or the server's newer `<noun>_read`/`_write`
+    // form. Prose like `pull_request` matches neither, so a name the prompt uses that is not on
+    // this list slips through; extend it when the server grows a verb.
+    const toolName =
+      /\b(?:(?:get|list|create|add|submit|delete|update|search|merge|request|push|fork|assign|dismiss|mark|manage|run|rerun|cancel|download|star|unstar)_[a-z_]+|[a-z_]+_(?:read|write))\b/g;
+    const named = [...new Set(prompt.match(toolName) ?? [])].sort();
+    expect(allowed.length).toBeGreaterThan(0);
+    expect(named).toEqual(allowed);
+  });
+
   it('grants the file-write tools on the fold mode only', () => {
     // Deny beats allow, so the deny list is the side that actually decides this.
     const deny = toolListModes(toolFlagValues(src, 'disallowedTools')[0]);
@@ -2119,7 +2140,29 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // that decides, so a subtraction here is a widening and has to be a deliberate edit.
     // `MultiEdit` and `NotebookEdit` are names this CLI does not know, so they deny nothing
     // today; they are kept because a rename is what would make them live and the cost is nil.
-    const plain = ['Bash', 'MultiEdit', 'NotebookEdit', 'ScheduleWakeup', 'WebFetch', 'WebSearch'];
+    // The same goes for the execution and work-launching names after them: the current names and
+    // the ones they replaced are both listed, because `@v1` floats and an unknown name costs nothing.
+    const plain = [
+      'Bash',
+      'MultiEdit',
+      'NotebookEdit',
+      'ScheduleWakeup',
+      'WebFetch',
+      'WebSearch',
+      'BashOutput',
+      'KillShell',
+      'KillBash',
+      'TaskOutput',
+      'TaskStop',
+      'PowerShell',
+      'Monitor',
+      'REPL',
+      'Tmux',
+      'Workflow',
+      'RemoteTrigger',
+      'CronCreate',
+      'EnterWorktree',
+    ];
     expect(deny.fold.filter(spec => !spec.includes('(')).sort()).toEqual([...plain].sort());
     expect(deny.review.filter(spec => !spec.includes('(')).sort()).toEqual([...plain, 'Edit', 'Write'].sort());
   });
