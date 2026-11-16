@@ -8,6 +8,17 @@ name: SST Deploy (reusable)
 #                   previews); caller passes `secrets: inherit`
 #
 # Optional secrets: SLACK_DEPLOY_WEBHOOK_URL (only required when notify_slack=true)
+#
+# Optional inputs worth setting:
+#   working_directory  Directory, relative to the repository root, that holds the
+#                      SST app (sst.config.ts, package.json, pnpm-lock.yaml).
+#                      Every pnpm/sst/validate/pre-deploy/post-deploy command runs
+#                      there. Default '.', the repository root. The preview
+#                      cleanup workflow does not read it.
+#   staging            When false, the deploy-staging job never runs, so a repo
+#                      with a single production stage can skip the staging deploy.
+#                      Default true. staging_stage and staging_env stay required
+#                      inputs, so pass placeholders when this is false.
 
 on:
   workflow_call:
@@ -37,6 +48,16 @@ on:
         required: false
         type: string
         default: main
+      working_directory:
+        description: Directory, relative to the repository root, that holds the SST app (sst.config.ts, package.json, pnpm-lock.yaml). Every install, validate, pre-deploy, deploy, unlock and post-deploy command runs there, and the pnpm cache keys off its lockfile. Defaults to the repository root.
+        required: false
+        type: string
+        default: '.'
+      staging:
+        description: When false, the deploy-staging job never runs (production and previews are unaffected). Use for a repo with a single production stage. staging_stage and staging_env are still required inputs; pass placeholders when this is false. Defaults true.
+        required: false
+        type: boolean
+        default: true
       validate_runner:
         description: runs-on label for the validate job. Defaults to the GitHub-hosted runner; pass a self-hosted fleet label (e.g. from vars.RUNNER_LABEL) to move validation off hosted minutes.
         required: false
@@ -121,6 +142,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ${{ inputs.validate_runner }}
     timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v6
@@ -130,6 +154,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
+          cache-dependency-path: ${{ inputs.working_directory }}/pnpm-lock.yaml
       - name: Configure npm auth (private @bike4mind/* packages)
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -146,9 +171,12 @@ jobs:
   deploy-staging:
     name: Deploy staging
     needs: validate
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    if: inputs.staging && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment:
       name: ${{ inputs.staging_env }}
       url: ${{ inputs.staging_url }}
@@ -168,6 +196,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
+          cache-dependency-path: ${{ inputs.working_directory }}/pnpm-lock.yaml
       - name: Configure npm auth (private @bike4mind/* packages)
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -245,6 +274,9 @@ jobs:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', inputs.prod_branch)
     runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment:
       name: ${{ inputs.prod_env }}
       url: ${{ inputs.prod_url }}
@@ -264,6 +296,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
+          cache-dependency-path: ${{ inputs.working_directory }}/pnpm-lock.yaml
       - name: Configure npm auth (private @bike4mind/* packages)
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -341,6 +374,9 @@ jobs:
     if: inputs.previews && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
     environment:
       name: pr${{ github.event.number }}
       url: https://pr${{ github.event.number }}.${{ inputs.preview_domain }}
@@ -361,6 +397,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
+          cache-dependency-path: ${{ inputs.working_directory }}/pnpm-lock.yaml
       - name: Configure npm auth (private @bike4mind/* packages)
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
