@@ -103,11 +103,11 @@ on:
       model_small:
         description: Model used when a PR is at or under both small-model thresholds.
         type: string
-        default: claude-sonnet-5
+        default: claude-sonnet-5-5
       model_large:
         description: Model used for everything else.
         type: string
-        default: claude-opus-4-7
+        default: claude-opus-5-5
       small_model_max_files:
         type: number
         default: 10
