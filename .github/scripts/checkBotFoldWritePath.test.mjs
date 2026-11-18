@@ -542,6 +542,7 @@ const PUSH_STEP_ENV_KEYS = [
   'SERVER_URL',
   'RUN_ID',
   'EXTRA_WRITE_DENY_GLOBS',
+  'APPLIED',
   'GIT_CONFIG_GLOBAL',
   'GIT_CONFIG_SYSTEM',
   'GIT_CONFIG_NOSYSTEM',
@@ -1261,6 +1262,19 @@ const ALWAYS_ON_EDIT_FENCES = [
   'Edit(//home/runner/.*/**)',
 ];
 
+/** claude-code-action's `SENSITIVE_PATHS` (src/github/operations/restore-config.ts): what its
+ * setup overwrites with the base branch's copy before the agent starts. */
+const ACTION_RESTORED_PATHS = [
+  '.claude',
+  '.mcp.json',
+  '.claude.json',
+  '.gitmodules',
+  '.ripgreprc',
+  'CLAUDE.md',
+  'CLAUDE.local.md',
+  '.husky',
+];
+
 /** The runner the `/home/runner/...` fences above are a premise about. */
 const RUNS_ON = 'runs-on: ${{ inputs.runner_label }}';
 
@@ -1493,7 +1507,7 @@ function runStagedGuards(
   
 
 const PUSH_HEAD_REF = 'feature/fold-target';
-const PUSH_TRACKED = ['README.md', 'src/a.ts', '.github/workflows/ci.yml', 'scripts/x.sh'];
+const PUSH_TRACKED = ['README.md', 'src/a.ts', '.github/workflows/ci.yml', 'scripts/x.sh', 'CLAUDE.md', 'docs/AGENTS.md'];
 
 /**
  * Runs the WHOLE `Push fold commit` body, lifted verbatim out of the committed YAML, against a
@@ -1651,6 +1665,9 @@ function runPushStep(src        , fixture             )              {
             SERVER_URL: 'https://github.com',
             RUN_ID: '1',
             EXTRA_WRITE_DENY_GLOBS: '',
+            // What `Read the fold count from the review` resolved: '1' unless a case models
+            // the review's own count (or its fail-closed '0').
+            APPLIED: fixture.applied ?? '1',
           };
           expect(substituted, `Push fold commit: unmodelled env key ${key}`).toHaveProperty(key);
           return [key, substituted[key] ?? ''];
@@ -2108,6 +2125,19 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
         // one holding `*` silences the dropped-untracked-file report without being staged.
         'Edit(.gitignore)',
         'Edit(**/.gitignore)',
+        // Every path claude-code-action restores from the base branch is unstaged by the push
+        // step, so an agent edit there would vanish silently; fenced so it fails on the spot.
+        // The instruction files are fenced at any depth too: they steer every later agent run.
+        'Edit(.husky/**)',
+        'Edit(.claude.json)',
+        'Edit(.gitmodules)',
+        'Edit(.ripgreprc)',
+        'Edit(CLAUDE.md)',
+        'Edit(**/CLAUDE.md)',
+        'Edit(CLAUDE.local.md)',
+        'Edit(**/CLAUDE.local.md)',
+        'Edit(AGENTS.md)',
+        'Edit(**/AGENTS.md)',
         ...ALWAYS_ON_EDIT_FENCES,
       ].sort()
     );
@@ -2391,7 +2421,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // `git add -u`, HEAD is the reviewed commit; after the `git commit` below it is the agent's
     // own fold commit, so a `git show HEAD:<path>` there reads back exactly what the agent just
     // wrote - which is why the exemption is one object path and not the `HEAD:` prefix.
-    for (const anchor of [/^ {10}git add -u$/m, /^ {12}-m "Workflow run: .*$/m]) {
+    for (const anchor of [/^ {10}git add -u\b.*$/m, /^ {12}-m "Workflow run: .*$/m]) {
       for (const body of shouldBeCaught) {
         const injected = src.replace(anchor, line => `${line}\n          ${body}`);
         expect(injected, 'the injection anchor moved').not.toBe(src);
@@ -2786,6 +2816,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       'Install bubblewrap',
       'Run /bot-review',
       'Verify a review was actually posted',
+      'Read the fold count from the review',
       'Mint fold push token (fold mode only)',
       'Push fold commit',
       'Report fold failure',
@@ -2823,6 +2854,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       ['Install bubblewrap', []],
       ['Run /bot-review', []],
       ['Verify a review was actually posted', ['GH_TOKEN', 'BOT_REVIEW_LOGIN', 'SINCE', 'REPO', 'PR']],
+      ['Read the fold count from the review', ['GH_TOKEN', 'BOT_REVIEW_LOGIN', 'SINCE', 'REPO', 'PR']],
       ['Mint fold push token (fold mode only)', []],
       ['Push fold commit', PUSH_STEP_ENV_KEYS],
       ['Report fold failure', ['GH_TOKEN', 'MINT_OUTCOME', 'PUSH_REASON', 'PR', 'REPO', 'SERVER_URL', 'RUN_ID']],
@@ -2895,7 +2927,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
       );
       const label = injected.split('\n')[0];
       expect(mutated, 'the step injection anchor moved').not.toBe(src);
-      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(25);
+      expect(stepNames(mutated), `a new step was not seen: ${label}`).toHaveLength(26);
       if (unnamed) expect(stepNames(mutated), `a name-less step was not seen: ${label}`).toContain(UNNAMED_STEP);
     }
   });
@@ -3304,8 +3336,10 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // Found in the PARSED command, not in the text: `git -c core.autocrlf=false add -- .`
     // appended after `git add -u` reads as a second staging invocation to git and as no
     // staging invocation at all to a matcher wanting `git add` with one space between.
+    // The `:(top,exclude)` pathspecs are claude-code-action's restored set (see the push step):
+    // a base-branch copy the action wrote, never an edit of the agent's, so never staged.
     expect(gitCommands(src, /^(add|update-index|stage)$/).map(words => words.map(unquoteWord))).toEqual([
-      ['git', 'add', '-u'],
+      ['git', 'add', '-u', '--', '.', ...ACTION_RESTORED_PATHS.map(p => `:(top,exclude)${p}`)],
     ]);
     // That sweep is a denylist of the three subcommands whose NAME says "stage", so it bounds
     // only the spellings it enumerates: `git apply --cached` writes arbitrary content straight
@@ -3338,6 +3372,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     // line every assertion here was content merely to FIND.
     expect(commandsNamed(src, /^set$/)).toEqual([
       ['set', '-euo', 'pipefail'],
+      ['set', '-uo', 'pipefail'],
       ['set', '-uo', 'pipefail'],
       ['set', '-euo', 'pipefail'],
       ['set', '-uo', 'pipefail'],
@@ -3548,6 +3583,8 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     );
     expect(exits).toEqual([
       ['none', '\n', 'exit 0', '\n'],
+      // A tree change on a review that applied no findings.
+      ['blocked', '\n', 'exit 1', '\n'],
       // An unusable extra_write_deny_globs entry, before the path guard is built.
       ['blocked', '\n', 'exit 1', '\n'],
       ['blocked', '\n', 'exit 1', '\n'],
@@ -3779,6 +3816,58 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     expect(deletion.out).toContain('past the 800-line bound');
   });
 
+  it('commits nothing on a review that applied no findings, whatever changed the tree', () => {
+    // The observed failure, reproduced: claude-code-action's setup restores the base branch's
+    // `CLAUDE.md` over the PR's before the agent starts, a clean review applies nothing, and
+    // `git add -u` used to stage the restore and push it as "apply review findings".
+    const restoredOnClean = runPushStep(src, { applied: '0', edits: [{ path: 'CLAUDE.md', lines: 2 }] });
+    expect(restoredOnClean.status, restoredOnClean.out).toBe(0);
+    expect(restoredOnClean.pushed).toEqual(['none']);
+    expect(restoredOnClean.remoteLog).toEqual(['base']);
+
+    // The same restore beside a real fix: the fix lands, the restore does not ride along.
+    const restoredBesideFix = runPushStep(src, {
+      applied: '1',
+      edits: [
+        { path: 'CLAUDE.md', lines: 2 },
+        { path: 'src/a.ts', lines: 4 },
+      ],
+    });
+    expect(restoredBesideFix.status, restoredBesideFix.out).toBe(0);
+    expect(restoredBesideFix.pushed).toEqual(['true']);
+    expect(restoredBesideFix.remoteChanged).toEqual(['src/a.ts']);
+
+    // Anything else that changed a tracked file on a clean review is refused loudly, not
+    // committed: a count of 0 and a missing marker (which the read step resolves to 0, and
+    // which an empty output reaches here as) are the same verdict.
+    for (const applied of ['0', '', 'many']) {
+      const changedOnClean = runPushStep(src, { applied, edits: [{ path: 'src/a.ts', lines: 4 }] });
+      expect(changedOnClean.status, `applied=${applied}: ${changedOnClean.out}`).toBe(1);
+      expect(changedOnClean.pushed, `applied=${applied}`).toEqual(['blocked']);
+      expect(changedOnClean.reason, `applied=${applied}`).toContain('reported no applied findings');
+      expect(changedOnClean.remoteLog, `applied=${applied}`).toEqual(['base']);
+    }
+
+    // An agent-instruction file the action does NOT restore is refused by the path guard.
+    const nestedInstructions = runPushStep(src, { applied: '1', edits: [{ path: 'docs/AGENTS.md', lines: 2 }] });
+    expect(nestedInstructions.status).toBe(1);
+    expect(nestedInstructions.pushed).toEqual(['blocked']);
+    expect(nestedInstructions.remoteLog).toEqual(['base']);
+  });
+
+  it('reads the fold count off the posted review, fail-closed to 0', () => {
+    const readStep = step(src, 'Read the fold count from the review');
+    // Same gate as the mint, so a count exists whenever a push step can run.
+    expect(ifConjuncts(src, 'Read the fold count from the review')).toEqual(
+      ifConjuncts(src, 'Mint fold push token (fold mode only)')
+    );
+    expect(readStep).toMatch(/^ {10}echo "applied=\$\{APPLIED:-0\}" >> "\$GITHUB_OUTPUT"$/m);
+    expect(step(src, 'Push fold commit')).toMatch(/^ {10}APPLIED: \$\{\{ steps\.fold_count\.outputs\.applied \}\}$/m);
+    // The agent is told to write the marker the read step greps for, verbatim.
+    expect(src).toContain('`<!-- bot-review-fold: applied=N -->`');
+    expect(readStep).toContain("grep -oE 'bot-review-fold: applied=[0-9]+'");
+  });
+
   it('puts on the remote exactly what the guards allowed, and nothing otherwise', () => {
     // END STATE, not spelling. Everything else about this step is either a pattern over its
     // text or an execution of the two bounds in the middle of it, which left the relation
@@ -3988,7 +4077,7 @@ describe('bot-fold write path', { timeout: 180_000 }, () => {
     }
     // And the same for the staging pin, which had the same literal shape.
     for (const staging of ['git -c core.autocrlf=false add -- .', 'git  add -- .', 'git update-index --add -- .']) {
-      const injected = src.replace(/^ {10}git add -u$/m, `          git add -u\n          ${staging}`);
+      const injected = src.replace(/^ {10}git add -u\b.*$/m, line => `${line}\n          ${staging}`);
       expect(injected, 'the injection anchor moved').not.toBe(src);
       expect(
         gitCommands(injected, /^(add|update-index|stage)$/).length,
