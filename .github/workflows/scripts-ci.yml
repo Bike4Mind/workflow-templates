@@ -9,6 +9,7 @@ on:
       - '.github/scripts/**'
       - '.github/actions/verify-promotion/**'
       - 'tests/**'
+      - '.github/tests/**'
       # Every workflow file, so a new reusable cannot land unvalidated. secrets-sweep
       # was opened with zero checks reported because nothing here matched it.
       - '.github/workflows/**'
@@ -84,6 +85,14 @@ jobs:
         env:
           PROMOTION_GATE_ENGINE: baseline
         run: node --test tests/promotion-gate.test.cjs
+
+  test-preview-cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Preview cleanup workflow tests
+        run: python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
 
   test-secrets-scan:
     runs-on: ubuntu-latest

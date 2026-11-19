@@ -74,6 +74,8 @@ jobs:
       !startsWith(github.event.pull_request.head.ref, 'release-please') &&
       !(github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'prod')
     runs-on: ubuntu-latest
+    outputs:
+      stage_removed: ${{ steps.removed.outputs.stage_removed }}
     timeout-minutes: ${{ inputs.cleanup_timeout_minutes }}
     # Bind to a dedicated env (default 'preview_cleanup'), NOT the pr<N> env
     # the job is about to delete. Binding to the deletion target creates an
@@ -142,6 +144,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-${{ github.run_id }}-pr${{ github.event.number }}-cleanup
       - name: Remove preview stage (idempotent)
+        id: remove
         if: steps.guard.outputs.has_app == 'true'
         uses: Bike4Mind/workflow-templates/.github/actions/sst-remove-idempotent@main
         with:
@@ -149,6 +152,49 @@ jobs:
           capture_mongodb_uri: 'false'
         env:
           SEED_APP_NAME: ${{ inputs.sst_app }}
+      # Everything after this point only touches GitHub records. The failure
+      # alert reads this output to say whether AWS is already clean.
+      - name: Mark stage removed
+        id: removed
+        if: steps.guard.outputs.has_app == 'false' || steps.remove.outcome == 'success'
+        run: echo "stage_removed=true" >> "$GITHUB_OUTPUT"
+      - name: Delete preview deployment records
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          set -euo pipefail
+          ENV="pr${PR_NUMBER}"
+          OUT=$(mktemp); ERR=$(mktemp)
+          # A burst of PR closes runs this step once per PR at the same time,
+          # and GitHub answers some of those calls with a 502. Retry server
+          # errors with backoff; anything else still fails closed. Output is
+          # only emitted from the attempt that succeeded, so a 502 mid-pagination
+          # cannot leak a partial id list into the loop below.
+          api() {
+            local attempt=1
+            while :; do
+              if gh api "$@" >"$OUT" 2>"$ERR"; then
+                cat "$OUT"
+                return 0
+              fi
+              if ! grep -q 'HTTP 5[0-9][0-9]' "$ERR" || [ "$attempt" -ge 5 ]; then
+                cat "$ERR" >&2
+                return 1
+              fi
+              echo "gh api $1 failed on attempt ${attempt}: $(cat "$ERR"); retrying" >&2
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+          }
+          DEPLOYMENTS=$(api --paginate "repos/${REPO}/deployments?environment=${ENV}&per_page=100" --jq '.[].id')
+          for id in $DEPLOYMENTS; do
+            api -X POST "repos/${REPO}/deployments/${id}/statuses" -f state=inactive >/dev/null
+            api -X DELETE "repos/${REPO}/deployments/${id}" >/dev/null
+          done
+          REMAINING=$(api --paginate "repos/${REPO}/deployments?environment=${ENV}&per_page=100" --jq '.[].id')
+          test -z "$REMAINING"
       - uses: actions/create-github-app-token@v3
         id: app-token
         with:
@@ -162,31 +208,29 @@ jobs:
         run: |
           set -euo pipefail
           ENV="pr${PR_NUMBER}"
-          # Mark all deployments on this env inactive and delete them first.
-          # Leaving active deployments behind causes GitHub to recreate the
-          # env after we delete it (a regression seen in practice). Listing
-          # deployments doesn't error on a missing env, so this works as a
-          # no-op when the env never existed.
-          DEPLOYMENTS=$(gh api "repos/${REPO}/deployments?environment=${ENV}&per_page=100" --jq '.[].id' 2>/dev/null || true)
-          for id in $DEPLOYMENTS; do
-            gh api -X POST "repos/${REPO}/deployments/${id}/statuses" \
-              -f state=inactive >/dev/null 2>&1 || true
-            gh api -X DELETE "repos/${REPO}/deployments/${id}" >/dev/null 2>&1 || true
-          done
           # Delete the env. Treat 404 as success (idempotent re-runs / PR
           # that closed before its first preview deploy). Any other failure
           # propagates and fails the job loudly. We rely on gh's exit code +
           # stderr message instead of probing first, because the bot token's
           # read permission on environments is inconsistent on some installs.
-          if OUT=$(gh api -X DELETE "repos/${REPO}/environments/${ENV}" 2>&1); then
-            echo "Environment ${ENV} deleted."
-          elif echo "$OUT" | grep -q "Not Found"; then
-            echo "Environment ${ENV} not present (already gone)."
-          else
-            echo "Failed to delete environment ${ENV}:"
-            echo "$OUT"
-            exit 1
-          fi
+          # Server errors are retried with backoff: a burst of PR closes runs
+          # this step concurrently per PR and GitHub answers some with a 502.
+          attempt=1
+          until OUT=$(gh api -X DELETE "repos/${REPO}/environments/${ENV}" 2>&1); do
+            if echo "$OUT" | grep -q "Not Found"; then
+              echo "Environment ${ENV} not present (already gone)."
+              exit 0
+            fi
+            if ! echo "$OUT" | grep -q 'HTTP 5[0-9][0-9]' || [ "$attempt" -ge 5 ]; then
+              echo "Failed to delete environment ${ENV}:"
+              echo "$OUT"
+              exit 1
+            fi
+            echo "Delete of environment ${ENV} failed on attempt ${attempt}: ${OUT}; retrying"
+            sleep $((attempt * 5))
+            attempt=$((attempt + 1))
+          done
+          echo "Environment ${ENV} deleted."
       - name: Comment PR with cleanup confirmation
         if: success()
         uses: actions/github-script@v8
@@ -213,6 +257,7 @@ jobs:
       pr_author: ${{ github.event.pull_request.user.login }}
       pr_url: ${{ github.event.pull_request.html_url }}
       stage_name: pr${{ github.event.number }}
+      stage_removed: ${{ needs.cleanup.outputs.stage_removed == 'true' }}
       repository: ${{ github.repository }}
       workflow_run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       mention: ${{ inputs.slack_mention }}

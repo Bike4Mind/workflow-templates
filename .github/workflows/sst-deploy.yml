@@ -525,10 +525,39 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-${{ github.run_id }}-pr${{ github.event.number }}
       - name: Verify PR is still open
+        id: verify_open
         uses: Bike4Mind/workflow-templates/.github/actions/verify-pr-open@main
         with:
           pr_number: ${{ github.event.number }}
           github_token: ${{ github.token }}
+      # A concurrency group holds one pending run, so a deploy queued here after
+      # a push evicts the PR-close cleanup waiting behind the running deploy.
+      # When the guard then stops this job, nothing else is left to remove the
+      # stage. Only on a confirmed closed PR: the guard also fails when its own
+      # state lookup errors.
+      - name: Confirm the PR is closed
+        id: confirm_closed
+        if: failure() && steps.verify_open.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          STATE=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .state)
+          echo "PR #${PR_NUMBER} state: ${STATE}"
+          if [ "$STATE" = "closed" ]; then
+            echo "closed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "closed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remove preview stage of the closed PR
+        if: failure() && steps.confirm_closed.outputs.closed == 'true'
+        uses: Bike4Mind/workflow-templates/.github/actions/sst-remove-idempotent@86a45a8475947dc5afd262ae5e086ab5e0408997 # main
+        with:
+          stage: pr${{ github.event.number }}
+          capture_mongodb_uri: 'false'
+        env:
+          SEED_APP_NAME: ${{ inputs.sst_app }}
       - name: Pre-deploy
         if: inputs.pre_deploy_command != ''
         env:
