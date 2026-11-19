@@ -7,6 +7,8 @@ on:
       - '.github/actions/check-overlay-deps/**'
       - '.github/actions/secrets-scan/**'
       - '.github/scripts/**'
+      - '.github/actions/verify-promotion/**'
+      - 'tests/**'
       # Every workflow file, so a new reusable cannot land unvalidated. secrets-sweep
       # was opened with zero checks reported because nothing here matched it.
       - '.github/workflows/**'
@@ -66,6 +68,22 @@ jobs:
       # comment at the top of redact-review-transcript.test.sh.
       - name: Redactor self-test
         run: bash .github/scripts/redact-review-transcript.test.sh
+
+  test-promotion-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Promotion gate tests against the action
+        run: node --test tests/promotion-gate.test.cjs
+      - name: Promotion gate tests against the frozen baseline
+        env:
+          PROMOTION_GATE_ENGINE: baseline
+        run: node --test tests/promotion-gate.test.cjs
 
   test-secrets-scan:
     runs-on: ubuntu-latest
