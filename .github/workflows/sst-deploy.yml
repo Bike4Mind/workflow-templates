@@ -19,10 +19,38 @@ name: SST Deploy (reusable)
 #                      with a single production stage can skip the staging deploy.
 #                      Default true. staging_stage and staging_env stay required
 #                      inputs, so pass placeholders when this is false.
+#   promotion_*        Opt-in console promotion of an exact approved SHA to
+#   policy_*           production. See the README. Leave all empty for the
+#                      ordinary push and preview behavior.
 
 on:
   workflow_call:
     inputs:
+      promotion_sha:
+        description: Exact approved main SHA. Promotion inputs enable the fail-closed console gate.
+        required: false
+        type: string
+        default: ''
+      promotion_actor:
+        description: Trusted console GitHub App bot login. Required for promotion.
+        required: false
+        type: string
+        default: ''
+      promotion_required_checks:
+        description: Nonempty JSON array of GitHub Actions check names required for promotion.
+        required: false
+        type: string
+        default: ''
+      policy_path:
+        description: Optional repository JSON policy on trusted main. Requires policy_digest.
+        required: false
+        type: string
+        default: ''
+      policy_digest:
+        description: SHA256 of sorted effective required check names. Requires policy_path.
+        required: false
+        type: string
+        default: ''
       sst_app:
         description: SST app name (matches `name` returned by sst.config.ts)
         required: true
@@ -137,9 +165,36 @@ env:
   PNPM_VERSION: ${{ inputs.pnpm_version }}
 
 jobs:
+  promotion-gate:
+    name: Verify console promotion
+    if: inputs.promotion_sha != '' || inputs.promotion_actor != '' || inputs.promotion_required_checks != '' || inputs.policy_path != '' || inputs.policy_digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+      deployments: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Verify source, actor and validation evidence
+        id: gate
+        uses: Bike4Mind/workflow-templates/.github/actions/verify-promotion@7149a9499c9f7a860fd517c31a972a89bcd5a14b
+        with:
+          promotion_sha: ${{ inputs.promotion_sha }}
+          promotion_actor: ${{ inputs.promotion_actor }}
+          promotion_required_checks: ${{ inputs.promotion_required_checks }}
+          staging_env: ${{ inputs.staging_env }}
+          policy_path: ${{ inputs.policy_path }}
+          policy_digest: ${{ inputs.policy_digest }}
+
   validate:
     name: Validate
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: promotion-gate
+    if: ${{ !cancelled() && (needs.promotion-gate.result == 'success' || needs.promotion-gate.result == 'skipped') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]') }}
+    outputs:
+      promotion_enabled: ${{ needs.promotion-gate.outputs.enabled }}
     runs-on: ${{ inputs.validate_runner }}
     timeout-minutes: 15
     defaults:
@@ -147,6 +202,8 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.promotion_sha || github.sha }}
       - uses: pnpm/action-setup@v6
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -171,7 +228,7 @@ jobs:
   deploy-staging:
     name: Deploy staging
     needs: validate
-    if: inputs.staging && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (needs.validate.outputs.promotion_enabled != 'true' && inputs.staging && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') }}
     runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     defaults:
@@ -271,7 +328,7 @@ jobs:
   deploy-production:
     name: Deploy production
     needs: validate
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', inputs.prod_branch)
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (needs.validate.outputs.promotion_enabled == 'true' || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', inputs.prod_branch))) }}
     runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     defaults:
@@ -283,12 +340,45 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      checks: read
+      actions: read
       deployments: write
     concurrency:
       group: deploy-${{ inputs.prod_env }}
       cancel-in-progress: false
     steps:
+      - name: Verify queued promotion before checkout
+        id: policy_entry
+        if: inputs.promotion_sha != '' || inputs.promotion_actor != '' || inputs.promotion_required_checks != '' || inputs.policy_path != '' || inputs.policy_digest != ''
+        uses: Bike4Mind/workflow-templates/.github/actions/verify-promotion@7149a9499c9f7a860fd517c31a972a89bcd5a14b
+        with:
+          promotion_sha: ${{ inputs.promotion_sha }}
+          promotion_actor: ${{ inputs.promotion_actor }}
+          promotion_required_checks: ${{ inputs.promotion_required_checks }}
+          staging_env: ${{ inputs.staging_env }}
+          policy_path: ${{ inputs.policy_path }}
+          policy_digest: ${{ inputs.policy_digest }}
+      - name: Start promotion deployment record
+        if: inputs.promotion_sha != ''
+        id: promotion_deployment
+        uses: actions/github-script@v8
+        env:
+          DEPLOY_SHA: ${{ inputs.promotion_sha }}
+          DEPLOY_ENV: ${{ inputs.prod_env }}
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({ ...context.repo, ref: process.env.DEPLOY_SHA, environment: process.env.DEPLOY_ENV, auto_merge: false, required_contexts: [], transient_environment: false, production_environment: true });
+            if (!deployment.data?.id || deployment.data.sha !== process.env.DEPLOY_SHA) throw new Error('Pinned deployment record was not created');
+            core.setOutput('id', deployment.data.id);
+            await github.rest.repos.createDeploymentStatus({ ...context.repo, deployment_id: deployment.data.id, state: 'in_progress', log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` });
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.promotion_sha || github.sha }}
+      - name: Verify checked out release
+        if: inputs.promotion_sha != ''
+        env:
+          EXPECTED_SHA: ${{ inputs.promotion_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: pnpm/action-setup@v6
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -305,6 +395,17 @@ jobs:
             echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           fi
       - run: pnpm install --frozen-lockfile
+      - name: Revalidate promotion policy before credentials
+        id: policy_recheck
+        if: inputs.policy_path != '' || inputs.policy_digest != ''
+        uses: Bike4Mind/workflow-templates/.github/actions/verify-promotion@7149a9499c9f7a860fd517c31a972a89bcd5a14b
+        with:
+          promotion_sha: ${{ inputs.promotion_sha }}
+          promotion_actor: ${{ inputs.promotion_actor }}
+          promotion_required_checks: ${{ inputs.promotion_required_checks }}
+          staging_env: ${{ inputs.staging_env }}
+          policy_path: ${{ inputs.policy_path }}
+          policy_digest: ${{ inputs.policy_digest }}
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -323,7 +424,7 @@ jobs:
           STAGE: ${{ inputs.prod_stage }}
         run: pnpm sst deploy --stage "$STAGE"
       - name: Unlock SST state on failure
-        if: failure() || cancelled()
+        if: (failure() || cancelled()) && steps.policy_entry.outcome != 'failure' && ((inputs.policy_path == '' && inputs.policy_digest == '') || (steps.policy_entry.outcome == 'success' && steps.policy_recheck.outcome == 'success'))
         env:
           STAGE: ${{ inputs.prod_stage }}
         run: |
@@ -338,10 +439,11 @@ jobs:
           POST_DEPLOY_CMD: ${{ inputs.post_deploy_command }}
         run: bash -c "$POST_DEPLOY_CMD"
       - name: Create deployment record
-        if: success()
+        if: success() && inputs.promotion_sha == ''
         continue-on-error: true
         uses: actions/github-script@v8
         env:
+          DEPLOY_SHA: ${{ inputs.promotion_sha || github.sha }}
           DEPLOY_ENV: ${{ inputs.prod_env }}
           DEPLOY_URL: ${{ inputs.prod_url }}
         with:
@@ -351,7 +453,7 @@ jobs:
             const dep = await github.rest.repos.createDeployment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              ref: context.sha,
+              ref: process.env.DEPLOY_SHA,
               environment: env,
               auto_merge: false,
               required_contexts: [],
@@ -367,11 +469,22 @@ jobs:
                 environment_url: url,
               });
             }
+      - name: Finish promotion deployment record
+        if: always() && steps.promotion_deployment.outputs.id != ''
+        uses: actions/github-script@v8
+        env:
+          DEPLOYMENT_ID: ${{ steps.promotion_deployment.outputs.id }}
+          DEPLOY_RESULT: ${{ job.status }}
+          DEPLOY_URL: ${{ inputs.prod_url }}
+        with:
+          script: |
+            const state = { success: 'success', failure: 'failure', cancelled: 'error' }[process.env.DEPLOY_RESULT] || 'error';
+            await github.rest.repos.createDeploymentStatus({ ...context.repo, deployment_id: Number(process.env.DEPLOYMENT_ID), state, environment_url: process.env.DEPLOY_URL, description: `Promotion ${process.env.DEPLOY_RESULT}`, log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` });
 
   preview-deploy:
     name: Deploy PR preview
     needs: validate
-    if: inputs.previews && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (inputs.previews && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]') }}
     runs-on: ${{ inputs.deploy_runner }}
     timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     defaults:
@@ -511,7 +624,7 @@ jobs:
       workflow_file: Deployment
       repository: ${{ github.repository }}
       branch: ${{ github.ref_name }}
-      commit_sha: ${{ github.sha }}
+      commit_sha: ${{ inputs.promotion_sha || github.sha }}
       commit_message: ${{ github.event.head_commit.message }}
       commit_author: ${{ github.event.head_commit.author.name }}
       commit_url: ${{ github.event.head_commit.url }}
