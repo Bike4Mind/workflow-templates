@@ -1,0 +1,59 @@
+name: Verify console promotion
+description: Verify approved source, trusted staging and checks, and repository policy without application code.
+inputs:
+  promotion_sha:
+    description: Exact approved main commit SHA.
+    required: false
+    default: ''
+  promotion_actor:
+    description: Trusted console GitHub App bot login.
+    required: false
+    default: ''
+  promotion_required_checks:
+    description: Nonempty JSON array of required GitHub Actions check names.
+    required: false
+    default: ''
+  staging_env:
+    description: Environment holding trusted explicit-SHA staging deployment evidence.
+    required: false
+    default: ''
+  policy_path:
+    description: Optional repository JSON policy on trusted main. Requires policy_digest.
+    required: false
+    default: ''
+  policy_digest:
+    description: SHA256 of sorted effective check names. Requires policy_path.
+    required: false
+    default: ''
+outputs:
+  enabled:
+    description: Whether promotion configuration enabled verification.
+    value: ${{ steps.verify.outputs.enabled }}
+  policy_digest:
+    description: Verified effective required-check digest when policy is enabled.
+    value: ${{ steps.verify.outputs.policy_digest }}
+  policy_source_commit:
+    description: Immutable main commit used to read the policy.
+    value: ${{ steps.verify.outputs.policy_source_commit }}
+  policy_blob_sha:
+    description: Verified repository policy blob SHA.
+    value: ${{ steps.verify.outputs.policy_blob_sha }}
+runs:
+  using: composite
+  steps:
+    - name: Verify source, actor and validation evidence
+      id: verify
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      env:
+        VERIFIER_PATH: ${{ github.action_path }}/verifier.cjs
+        PROMOTION_SHA: ${{ inputs.promotion_sha }}
+        PROMOTION_ACTOR: ${{ inputs.promotion_actor }}
+        REQUIRED_CHECKS: ${{ inputs.promotion_required_checks }}
+        STAGING_ENV: ${{ inputs.staging_env }}
+        TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        POLICY_PATH: ${{ inputs.policy_path }}
+        POLICY_DIGEST: ${{ inputs.policy_digest }}
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          await require(process.env.VERIFIER_PATH)({github, context, core});
