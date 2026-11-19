@@ -32,6 +32,7 @@ name: Overlay CI (reusable)
 #         use_host_app_token: <bool>
 #         node_version: '<ver>'
 #         extra_packages: '<space-separated pnpm filters>'   # optional
+#         run_data_subject_coverage: <bool>                  # optional, default true
 
 on:
   workflow_call:
@@ -73,6 +74,14 @@ on:
         required: false
         type: string
         default: '@bike4mind/scripts'
+      run_data_subject_coverage:
+        description: >-
+          Run the host's data-holder coverage test with this overlay composed in, so the
+          overlay's contributed data-subject classifications are checked against the host's
+          full rule set. Skipped automatically when the host has no such test. Set false to opt out.
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   ci:
@@ -287,6 +296,19 @@ jobs:
 
       - name: Test
         run: pnpm --filter @bike4mind/premium-${{ inputs.overlay_name }} run test
+
+      # Contributed data-subject classifications are otherwise never checked against the host's
+      # full rule set (incl. name-based schema checks) before merge. Needs no Mongo or env.
+      - name: Data-holder coverage (host rules)
+        if: ${{ inputs.run_data_subject_coverage }}
+        run: |
+          set -euo pipefail
+          test_file=server/dataSubject/dataHolderCoverage.test.ts
+          if [ ! -f "apps/client/${test_file}" ]; then
+            echo "::notice::host has no apps/client/${test_file}; skipping data-holder coverage."
+            exit 0
+          fi
+          pnpm --filter @bike4mind/client exec vitest run "${test_file}"
 
       # The overlay's own package compiling is NOT the same question as the
       # composed workspace compiling. generate-premium-glue.mjs writes generated
