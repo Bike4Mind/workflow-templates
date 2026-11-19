@@ -119,3 +119,44 @@ PROMOTION_GATE_ENGINE=baseline node --test tests/promotion-gate.test.cjs
 ```
 
 The frozen verifier under `tests/fixtures` preserves the pre-extraction behavior for the same adversarial fixtures. Workflow tests separately assert the three immutable action references, input/output wiring, production ordering, legacy skip behavior and guarded failure cleanup. Local equivalence does not replace a live run in a sandbox repository.
+
+## sst-preview-sweep
+
+`sst-preview-sweep.yml` is the nightly backstop for `sst-preview-cleanup.yml`. It lists `app/<sst_app>/pr<N>.json` in the SST state bucket and removes stages whose PR is closed, or open and idle past `ttl_hours` (default 72; `0` = closed PRs only). Open PRs inside the TTL and stages with no matching PR in the calling repo are never touched. A candidate whose state object holds no resources (`sst remove` empties the object but never deletes it) is dropped from the bucket without spending a removal slot.
+
+A second pass reads GitHub instead of the bucket: it deletes the deployment records of closed PRs (up to `max_record_deletions` per run, default 150) and, when the bot app is configured, their `pr<N>` environments. Deployment records use the workflow token. Environments need the repository Administration permission, which the workflow token cannot hold, so without `B4M_CI_BOT_APP_ID` and `B4M_CI_BOT_PRIVATE_KEY` that step is skipped with a notice.
+
+It needs the same `preview_cleanup` environment as cleanup, and that environment's role must be able to list the state bucket and read and delete its `app/<sst_app>/pr*.json` objects. Set `aws_region` to the region of the app's stages; the default is `us-east-2`.
+
+```yaml
+name: Preview sweep
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report decisions only; remove nothing.
+        type: boolean
+        default: false
+
+# A reusable workflow cannot ask for more than its caller holds.
+permissions:
+  contents: read
+  deployments: write
+  id-token: write
+  pull-requests: write
+
+jobs:
+  sweep:
+    uses: Bike4Mind/workflow-templates/.github/workflows/sst-preview-sweep.yml@<sha>
+    with:
+      sst_app: my-app
+      state_bucket: sst-state-xxxx
+      aws_region: us-east-1
+      # Closed PRs only: an open PR keeps its preview however long it sits idle.
+      ttl_hours: 0
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit
+```

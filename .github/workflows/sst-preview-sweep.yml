@@ -1,0 +1,394 @@
+name: SST Preview Sweep (reusable)
+
+# Nightly backstop for sst-preview-cleanup.yml. Lists the app's per-PR stages in
+# the SST state bucket and removes any whose PR is closed, or whose PR is open
+# but idle past the TTL. Covers cleanup runs that failed, never ran, or were
+# never re-run after failing.
+#
+# Safety invariant: a stage whose PR is open and within the TTL is never
+# removed, and a stage with no matching PR in the calling repo is never touched.
+#
+# Caller should trigger via `schedule` plus `workflow_dispatch`, and pass the
+# dispatch inputs through. Same prerequisites as sst-preview-cleanup.yml: the
+# `cleanup_env` Environment holding AWS_ROLE_ARN (its role must be able to list
+# the state bucket and read and delete its app/<sst_app>/pr*.json objects).
+#
+# Deployment records are deleted with the workflow token. Deleting a GitHub
+# Environment needs the repository Administration permission, which the
+# workflow token cannot hold, so environments are deleted only when the
+# B4M_CI_BOT_APP_ID variable and B4M_CI_BOT_PRIVATE_KEY secret are set, and
+# skipped with a notice otherwise.
+
+on:
+  workflow_call:
+    inputs:
+      sst_app:
+        required: true
+        type: string
+      state_bucket:
+        description: SST state bucket holding app/<sst_app>/pr<N>.json objects.
+        required: true
+        type: string
+      aws_region:
+        required: false
+        type: string
+        default: us-east-2
+      node_version:
+        required: false
+        type: string
+        default: '22.x'
+      pnpm_version:
+        required: false
+        type: string
+        default: '10.29.3'
+      cleanup_env:
+        required: false
+        type: string
+        default: preview_cleanup
+      ttl_hours:
+        description: Also remove OPEN-PR stages idle longer than this. 0 = closed PRs only.
+        required: false
+        type: number
+        default: 72
+      max_removals:
+        description: Max stages removed per run; the rest wait for the next sweep.
+        required: false
+        type: number
+        default: 10
+      dry_run:
+        description: Report decisions only; remove nothing.
+        required: false
+        type: boolean
+        default: false
+      removal_timeout_minutes:
+        required: false
+        type: number
+        default: 45
+      max_record_deletions:
+        description: Max deployment records of closed PRs deleted per run; the rest wait for the next sweep.
+        required: false
+        type: number
+        default: 150
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      B4M_CI_BOT_PRIVATE_KEY:
+        required: false
+
+env:
+  AWS_REGION: ${{ inputs.aws_region }}
+  NODE_VERSION: ${{ inputs.node_version }}
+  PNPM_VERSION: ${{ inputs.pnpm_version }}
+
+jobs:
+  plan:
+    name: Decide which stages to remove
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ inputs.cleanup_env }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.decide.outputs.matrix }}
+      count: ${{ steps.decide.outputs.count }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}-sweep-plan
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BUCKET: ${{ inputs.state_bucket }}
+          APP: ${{ inputs.sst_app }}
+          TTL_HOURS: ${{ inputs.ttl_hours }}
+          MAX_REMOVALS: ${{ inputs.max_removals }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -uo pipefail
+          NOW=$(date +%s)
+          TTL_SECONDS=$(( TTL_HOURS * 3600 ))
+          {
+            echo "## Preview sweep (${APP}, TTL ${TTL_HOURS}h, dry_run=${DRY_RUN}, cap ${MAX_REMOVALS})"
+            echo ""
+            echo "| stage | PR state | age (h) | decision |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Each deploy rewrites the stage's state object, so LastModified is
+          # the last-deploy time. A listing failure must fail the job, not read
+          # as "no stages".
+          LISTING=$(aws s3api list-objects-v2 --bucket "$BUCKET" \
+            --prefix "app/${APP}/pr" \
+            --query 'Contents[].[Key,LastModified]' --output text) || exit 1
+          [ "$LISTING" = "None" ] && LISTING=""
+
+          STAGES=()
+          DEFERRED=0
+          while read -r KEY MODIFIED; do
+            [ -n "$KEY" ] || continue
+            STAGE=$(basename "$KEY" .json)
+            N="${STAGE#pr}"
+            [[ "$N" =~ ^[0-9]+$ ]] || continue
+            AGE=$(( NOW - $(date -d "$MODIFIED" +%s) ))
+            # API failure or 404 -> "absent" -> never removed.
+            STATE=$(gh api "repos/${REPO}/pulls/${N}" --jq .state 2>/dev/null) || STATE=absent
+            [ "$STATE" = "absent" ] && continue
+
+            REASON=""
+            if [ "$STATE" = "closed" ]; then REASON="PR closed"
+            elif [ "$STATE" = "open" ] && [ "$TTL_HOURS" -gt 0 ] && [ "$AGE" -gt "$TTL_SECONDS" ]; then REASON="TTL exceeded"
+            fi
+
+            # `sst remove` rewrites the state object with no resources rather
+            # than deleting it, so a stage the PR-close cleanup (or an earlier
+            # sweep) already removed keeps listing as a candidate. Re-removing
+            # it is a no-op that still burns a slot of the per-run cap, and a
+            # handful of those at the front of the listing starve every real
+            # orphan behind them indefinitely. Drop the empty object instead;
+            # it costs no slot. If the read or delete fails, fall through to
+            # the normal removal path.
+            DECISION=""
+            if [ -n "$REASON" ]; then
+              RESOURCES=$(aws s3 cp "s3://${BUCKET}/${KEY}" - 2>/dev/null | jq '(.checkpoint.latest.resources // []) | length') || RESOURCES=unknown
+              if [ "$RESOURCES" = "0" ]; then
+                if [ "$DRY_RUN" = "true" ]; then DECISION="would drop empty state (${REASON})"
+                elif aws s3api delete-object --bucket "$BUCKET" --key "$KEY" >/dev/null; then DECISION="dropped empty state (${REASON})"
+                else echo "::warning::Could not delete ${KEY}; handing ${STAGE} to sst remove instead."
+                fi
+              fi
+            fi
+
+            if [ -n "$DECISION" ]; then :
+            elif [ -z "$REASON" ]; then DECISION="keep"
+            elif [ "$DRY_RUN" = "true" ]; then DECISION="would remove (${REASON})"
+            elif [ "${#STAGES[@]}" -ge "$MAX_REMOVALS" ]; then DEFERRED=$((DEFERRED + 1)); DECISION="deferred (cap reached; ${REASON})"
+            else STAGES+=("$N"); DECISION="removing (${REASON})"
+            fi
+            echo "| ${STAGE} | ${STATE} | $(( AGE / 3600 )) | ${DECISION} |" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$LISTING"
+
+          [ "$DEFERRED" -gt 0 ] && echo "::warning::${DEFERRED} removal(s) deferred by the ${MAX_REMOVALS}-per-run cap; the next sweep continues."
+          # grep exits 1 on no match, which under pipefail would fail the job
+          # on a quiet night (nothing to remove) and on every dry run.
+          MATRIX=$(printf '%s\n' "${STAGES[@]:-}" | { grep -E '^[0-9]+$' || true; } | jq -R -s -c '{pr: (split("\n") | map(select(length>0)))}')
+          [ -n "$MATRIX" ] || MATRIX='{"pr":[]}'
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "count=${#STAGES[@]}" >> "$GITHUB_OUTPUT"
+
+  remove:
+    name: Remove pr${{ matrix.pr }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.removal_timeout_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    environment:
+      name: ${{ inputs.cleanup_env }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      deployments: write
+    # Same group as the preview deploy and the PR-close cleanup, so a removal
+    # queues behind an in-flight deploy instead of racing it.
+    concurrency:
+      group: deploy-pr${{ matrix.pr }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}-pr${{ matrix.pr }}-sweep
+      - name: Remove preview stage (idempotent)
+        uses: Bike4Mind/workflow-templates/.github/actions/sst-remove-idempotent@main
+        with:
+          stage: pr${{ matrix.pr }}
+          capture_mongodb_uri: 'false'
+        env:
+          SEED_APP_NAME: ${{ inputs.sst_app }}
+      - name: Delete preview deployment records
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENV_NAME: pr${{ matrix.pr }}
+        run: |
+          set -euo pipefail
+          OUT=$(mktemp); ERR=$(mktemp)
+          api() {
+            local attempt=1
+            while :; do
+              if gh api "$@" >"$OUT" 2>"$ERR"; then
+                cat "$OUT"
+                return 0
+              fi
+              if ! grep -q 'HTTP 5[0-9][0-9]' "$ERR" || [ "$attempt" -ge 5 ]; then
+                cat "$ERR" >&2
+                return 1
+              fi
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+          }
+          DEPLOYMENTS=$(api --paginate "repos/${REPO}/deployments?environment=${ENV_NAME}&per_page=100" --jq '.[].id')
+          for id in $DEPLOYMENTS; do
+            api -X POST "repos/${REPO}/deployments/${id}/statuses" -f state=inactive >/dev/null
+            api -X DELETE "repos/${REPO}/deployments/${id}" >/dev/null
+          done
+          REMAINING=$(api --paginate "repos/${REPO}/deployments?environment=${ENV_NAME}&per_page=100" --jq '.[].id')
+          test -z "$REMAINING"
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        if: vars.B4M_CI_BOT_APP_ID != ''
+        with:
+          app-id: ${{ vars.B4M_CI_BOT_APP_ID }}
+          private-key: ${{ secrets.B4M_CI_BOT_PRIVATE_KEY }}
+      - name: Delete GitHub Environment
+        if: steps.app-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ENV_NAME: pr${{ matrix.pr }}
+        run: |
+          if OUT=$(gh api -X DELETE "repos/${REPO}/environments/${ENV_NAME}" 2>&1); then
+            echo "Environment ${ENV_NAME} deleted."
+          elif echo "$OUT" | grep -q "Not Found"; then
+            echo "Environment ${ENV_NAME} not present."
+          else
+            echo "$OUT"; exit 1
+          fi
+      - name: Comment on the PR if it was still open
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ matrix.pr }}
+        with:
+          script: |
+            const issue_number = Number(process.env.PR_NUMBER);
+            const { owner, repo } = context.repo;
+            const { data } = await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
+            if (data.state !== 'open') return;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: `The preview for this PR was idle past the sweep TTL and has been removed. Push a commit to redeploy it.`,
+            });
+
+  # A stage can already be gone while its GitHub records are not: a deploy for a
+  # closed PR recreates the pr<N> environment through its job binding, and older
+  # cleanups could not delete deployment records. This pass reads GitHub, not
+  # the state bucket, so it catches those whatever the stage's state.
+  closed-pr-records:
+    name: Clear records of closed PRs
+    needs: [plan, remove]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: read
+    steps:
+      - name: Delete deployment records of closed PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_RECORDS: ${{ inputs.max_record_deletions }}
+        run: |
+          set -euo pipefail
+          OUT=$(mktemp); ERR=$(mktemp)
+          api() {
+            local attempt=1
+            while :; do
+              if gh api "$@" >"$OUT" 2>"$ERR"; then
+                cat "$OUT"
+                return 0
+              fi
+              if ! grep -q 'HTTP 5[0-9][0-9]' "$ERR" || [ "$attempt" -ge 5 ]; then
+                cat "$ERR" >&2
+                return 1
+              fi
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+          }
+          LISTING=$(api --paginate "repos/${REPO}/deployments?per_page=100" --jq '.[] | "\(.id) \(.environment)"')
+          # Sorted by environment so each PR is looked up once. A failed or 404
+          # lookup reads as "absent", which is never deleted.
+          LISTING=$(printf '%s\n' "$LISTING" | sort -k2,2 -k1,1n)
+          LAST_N=""; STATE=""
+          DONE=0; LEFT=0
+          while read -r ID ENV_NAME; do
+            [ -n "${ID:-}" ] || continue
+            [[ "${ENV_NAME:-}" =~ ^pr([0-9]+)$ ]] || continue
+            N="${BASH_REMATCH[1]}"
+            if [ "$N" != "$LAST_N" ]; then
+              STATE=$(api "repos/${REPO}/pulls/${N}" --jq .state 2>/dev/null) || STATE=absent
+              LAST_N="$N"
+            fi
+            [ "$STATE" = "closed" ] || continue
+            if [ "$DONE" -ge "$MAX_RECORDS" ]; then LEFT=$((LEFT + 1)); continue; fi
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would delete deployment ${ID} (${ENV_NAME})"
+            else
+              api -X POST "repos/${REPO}/deployments/${ID}/statuses" -f state=inactive >/dev/null
+              api -X DELETE "repos/${REPO}/deployments/${ID}" >/dev/null
+              echo "deleted deployment ${ID} (${ENV_NAME})"
+            fi
+            DONE=$((DONE + 1))
+          done <<< "$LISTING"
+          echo "Closed-PR deployment records: ${DONE} handled (dry_run=${DRY_RUN}), ${LEFT} left for the next sweep." | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Skip environment deletion without the bot app
+        if: vars.B4M_CI_BOT_APP_ID == ''
+        run: echo "::notice::B4M_CI_BOT_APP_ID is not set; closed-PR environments were not deleted."
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        if: vars.B4M_CI_BOT_APP_ID != ''
+        with:
+          app-id: ${{ vars.B4M_CI_BOT_APP_ID }}
+          private-key: ${{ secrets.B4M_CI_BOT_PRIVATE_KEY }}
+      - name: Delete environments of closed PRs
+        if: steps.app-token.outcome == 'success'
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ENVS=$(GH_TOKEN="$APP_TOKEN" gh api --paginate "repos/${REPO}/environments?per_page=100" --jq '.environments[].name')
+          FAILED=0
+          while read -r ENV_NAME; do
+            [[ "${ENV_NAME:-}" =~ ^pr([0-9]+)$ ]] || continue
+            STATE=$(GH_TOKEN="$PR_TOKEN" gh api "repos/${REPO}/pulls/${BASH_REMATCH[1]}" --jq .state 2>/dev/null) || STATE=absent
+            [ "$STATE" = "closed" ] || continue
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would delete environment ${ENV_NAME}"
+            elif OUT=$(GH_TOKEN="$APP_TOKEN" gh api -X DELETE "repos/${REPO}/environments/${ENV_NAME}" 2>&1); then
+              echo "deleted environment ${ENV_NAME}"
+            elif echo "$OUT" | grep -q "Not Found"; then
+              echo "environment ${ENV_NAME} already gone"
+            else
+              echo "failed to delete environment ${ENV_NAME}: ${OUT}"
+              FAILED=1
+            fi
+          done <<< "$ENVS"
+          exit "$FAILED"
