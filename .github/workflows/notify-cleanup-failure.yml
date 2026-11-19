@@ -26,6 +26,11 @@ on:
         description: 'SST stage name that failed to cleanup'
         required: true
         type: string
+      stage_removed:
+        description: 'True when sst remove already succeeded and only the GitHub record cleanup failed'
+        required: false
+        type: boolean
+        default: false
       repository:
         description: 'Repository name'
         required: false
@@ -90,7 +95,7 @@ jobs:
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": "⚠️ *Manual cleanup required* - This environment may be orphaned and consuming AWS resources."
+                    "text": "${{ inputs.stage_removed && '✅ *AWS stage already removed.* Only the GitHub deployment-record or environment cleanup failed; no AWS resources are orphaned. Re-run the failed job to clear the records.' || '⚠️ *Manual cleanup required* - This environment may be orphaned and consuming AWS resources.' }}"
                   }
                 },
                 {
