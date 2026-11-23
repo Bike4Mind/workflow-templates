@@ -540,12 +540,20 @@ jobs:
               `pnpm-workspace.yaml`, `turbo.json`, `.npmrc` or `.dockerignore`, any
               `Dockerfile` whatever its suffix, any `*.sh`, `*.bash` or `*.zsh`, any
               extensionless repo-root file, any repo-root dotfile, and any binary
-              file. Findings in those files belong in the review body for a human
+              file, and any `CLAUDE.md`, `CLAUDE.local.md` or `AGENTS.md` at any
+              depth. Findings in those files belong in the review body for a human
               to apply; do not edit them,
-              or you lose the whole fixup. `.github/`, `.git/`, `.claude/`,
-              `.mcp.json`, `.gitattributes` and `.gitignore` (at any depth for the
-              last two) are denied to your write tools outright, so an edit there
-              fails on the spot rather than costing you the fold.
+              or you lose the whole fixup. `.github/`, `.git/`, `.claude/`, `.husky/`,
+              `.mcp.json`, `.claude.json`, `.gitmodules`, `.ripgreprc`, `.gitattributes`,
+              `.gitignore`, `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md` are denied to
+              your write tools outright, so an edit there fails on the spot rather than
+              costing you the fold.
+            - When FOLD_MODE is 'true', end the review body with exactly one line
+              `<!-- bot-review-fold: applied=N -->`, where N is the number of
+              findings you applied to the working tree (0 when you applied none,
+              including when there was nothing to flag). The commit step reads
+              this line: with N = 0, or with the line missing, it commits nothing,
+              and refuses loudly if the working tree changed anyway.
             - When FOLD_MODE is 'true', never submit the review as APPROVE.
               The fold commit is pushed right after your review lands, and a repo
               that dismisses stale reviews on push would show an approval that
@@ -630,6 +638,11 @@ jobs:
             # run a `filter.*.clean` command out of `.git/info/attributes` in the step
             # holding the push token. Denying Read(.git/**) blocks writes there today
             # as well, but that is harness behaviour rather than a contract.
+            # `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md` (any depth), `.husky/**`,
+            # `.claude.json`, `.gitmodules` and `.ripgreprc` are fenced because the push
+            # step never stages claude-code-action's restored set (see `Push fold commit`),
+            # so an agent edit there would be dropped silently; the instruction files also
+            # steer every later agent run on the branch, so they are a human's call.
             # `.claude/**` and `.mcp.json` are fenced for the same "do not rest on the
             # vendor" reason: `.claude/settings.json` can declare `hooks` and
             # `.mcp.json` can declare an MCP server, and both are command execution
@@ -743,7 +756,7 @@ jobs:
             # turn, and EnterWorktree writes a worktree. An unknown name costs a
             # startup warning, like MultiEdit. --allowedTools is still the real fence;
             # this only keeps a future widening of it from granting these.
-            --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),Edit(//home/runner/.*),Edit(//home/runner/.*/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,PowerShell,Monitor,REPL,Tmux,Workflow,RemoteTrigger,CronCreate,EnterWorktree,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,PowerShell,Monitor,REPL,Tmux,Workflow,RemoteTrigger,CronCreate,EnterWorktree,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**)' }}"
+            --disallowedTools "Edit(/${{ runner.temp }}/**),Edit(//home/runner/work/_*/**),Edit(//home/runner/runners/**),Edit(//home/runner/.bun/**),Edit(//home/runner/.*),Edit(//home/runner/.*/**),${{ env.FOLD_MODE == 'true' && 'Bash,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,PowerShell,Monitor,REPL,Tmux,Workflow,RemoteTrigger,CronCreate,EnterWorktree,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**),Edit(.github/**),Edit(.git/**),Edit(.claude/**),Edit(.mcp.json),Edit(.gitattributes),Edit(**/.gitattributes),Edit(.gitignore),Edit(**/.gitignore),Edit(.husky/**),Edit(.claude.json),Edit(.gitmodules),Edit(.ripgreprc),Edit(CLAUDE.md),Edit(**/CLAUDE.md),Edit(CLAUDE.local.md),Edit(**/CLAUDE.local.md),Edit(AGENTS.md),Edit(**/AGENTS.md)' || 'Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,ScheduleWakeup,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,PowerShell,Monitor,REPL,Tmux,Workflow,RemoteTrigger,CronCreate,EnterWorktree,Read(.git/**),Read(//proc/**),Read(//sys/**),Read(/${{ runner.temp }}/claude-workload-identity/**)' }}"
             --max-turns ${{ inputs.max_turns }}
 
       - name: Verify a review was actually posted
@@ -807,6 +820,34 @@ jobs:
 
           if [ $((REVIEWS + INLINE + ISSUE)) -gt 0 ]; then emit true; else emit false; fi
 
+      # The review's own statement of what it applied, read back off the posted review
+      # rather than inferred from the working tree. The tree is not the agent's alone:
+      # claude-code-action's setup rewrites paths in it before the agent starts (see
+      # `Push fold commit`), and a clean review once pushed exactly such a rewrite as
+      # "apply review findings". FAIL-CLOSED: a missing marker, an API error or a
+      # malformed count all resolve to 0, which the push step reads as "commit nothing".
+      - name: Read the fold count from the review
+        id: fold_count
+        if: |
+          !cancelled() && env.FOLD_MODE == 'true' &&
+          steps.bot_review.outcome == 'success' &&
+          steps.review_posted.outputs.posted == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_REVIEW_LOGIN: 'claude[bot]'
+          SINCE: ${{ steps.review_start.outputs.at }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          SEL=".[] | select(.user.login==\"${BOT_REVIEW_LOGIN}\" and .submitted_at != null and .submitted_at >= \"${SINCE}\") | .body"
+          # The LAST marker across this run's reviews: the prompt asks for one review, and
+          # if a retry posted two, the later one describes the tree the push step sees.
+          APPLIED=$(gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" --jq "$SEL" |
+            grep -oE 'bot-review-fold: applied=[0-9]+' | tail -n 1 | cut -d= -f2) || APPLIED=""
+          echo "fold_count: applied=${APPLIED:-<no marker>}"
+          echo "applied=${APPLIED:-0}" >> "$GITHUB_OUTPUT"
+
       # Fold mode only, and deliberately AFTER the review is posted rather than at
       # the top of the job. Minting up front meant a mint failure killed the job
       # with `steps.bot_review.outcome == 'skipped'`, which none of the reporting
@@ -859,6 +900,7 @@ jobs:
           SERVER_URL: ${{ github.server_url }}
           RUN_ID: ${{ github.run_id }}
           EXTRA_WRITE_DENY_GLOBS: ${{ inputs.extra_write_deny_globs }}
+          APPLIED: ${{ steps.fold_count.outputs.applied }}
           # Load-bearing, not hygiene. Every `git` below reads config, and on a fold
           # run the `$HOME` dot-path fence keeps the agent off `~/.gitconfig` only on the
           # hosted image, because it names that image's path. A global `filter.<x>.clean` plus a working-tree
@@ -915,11 +957,29 @@ jobs:
           # and not only in a run log nobody opens.
           echo "dropped=$(printf '%s' "$UNTRACKED" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
-          git add -u
+          # claude-code-action's setup overwrites these paths with the BASE branch's copy
+          # before the agent starts ("Restoring ... from origin/main (PR head is untrusted)"),
+          # so on a PR that edits any of them the working tree holds a revert the agent never
+          # made. Staging them is how a clean review once pushed a revert of the PR's own
+          # `CLAUDE.md`. Must stay in sync with `SENSITIVE_PATHS` in the action's
+          # src/github/operations/restore-config.ts. The agent's write fence denies every
+          # one of them, so excluding them here drops no edit of the agent's.
+          git add -u -- . ':(top,exclude).claude' ':(top,exclude).mcp.json' ':(top,exclude).claude.json' ':(top,exclude).gitmodules' ':(top,exclude).ripgreprc' ':(top,exclude)CLAUDE.md' ':(top,exclude)CLAUDE.local.md' ':(top,exclude).husky'
           if git diff --cached --quiet; then
             echo "fold: the agent changed no tracked file; nothing to push"
             emit none
             exit 0
+          fi
+
+          # The review's own count of applied findings gates the commit, so a clean verdict
+          # never commits whatever else changed the tree. Before the path guard on purpose:
+          # with nothing applied there is no fixup to bound, only a tree change to explain.
+          if ! printf '%s\n' "${APPLIED:-}" | grep -qxE '[1-9][0-9]*'; then
+            echo "::error::fold refused: the review reported no applied findings, yet these tracked files changed, so NOTHING was pushed:"
+            git -c core.quotePath=false diff --cached --name-only
+            echo "reason=the review reported no applied findings (its \`bot-review-fold: applied=N\` line was 0 or missing), yet tracked files changed in the checkout. Something other than the review's fixes changed them, so nothing was committed and the branch is untouched." >> "$GITHUB_OUTPUT"
+            emit blocked
+            exit 1
           fi
 
           # An extra caller-supplied set of directory names, ORed into the directory
@@ -1038,6 +1098,7 @@ jobs:
               -e '(^|/)package\.json$' \
               -e '(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|pnpm-workspace\.yaml|turbo\.json|\.npmrc|\.dockerignore)$' \
               -e '(^|/)Dockerfile(\..*)?$' \
+              -e '(^|/)(CLAUDE|CLAUDE\.local|AGENTS)\.md$' \
               -e '\.(sh|bash|zsh)$' \
               -e '^[^/.]+$' \
               -e '^\.[^/]*$' "$STAGED_PATHS" | tr '\0' '\n' || [ $? -eq 1 ] || exit 2
@@ -1067,7 +1128,7 @@ jobs:
             if [ -n "${EXTRA_WRITE_DENY_GLOBS:-}" ]; then
               EXTRA_HINT=" This repo also denies: ${EXTRA_WRITE_DENY_GLOBS}."
             fi
-            echo "reason=the fixup touched CI configuration (anything under \`.github/\`, \`.husky/\`, \`.claude/\`, \`.changeset/\`, \`scripts/\`, \`infra/\` or \`patches/\`, a \`package.json\`, a lockfile, \`pnpm-workspace.yaml\`, \`turbo.json\`, \`.npmrc\`, a \`Dockerfile\` of any suffix or \`.dockerignore\`, a \`*.sh\`/\`*.bash\`/\`*.zsh\`, or any extensionless repo-root file or repo-root dotfile), or a binary file, which fold mode never pushes.${EXTRA_HINT} Nothing was committed, so the branch is untouched. Those findings need a human." >> "$GITHUB_OUTPUT"
+            echo "reason=the fixup touched CI configuration (anything under \`.github/\`, \`.husky/\`, \`.claude/\`, \`.changeset/\`, \`scripts/\`, \`infra/\` or \`patches/\`, a \`package.json\`, a lockfile, \`pnpm-workspace.yaml\`, \`turbo.json\`, \`.npmrc\`, a \`Dockerfile\` of any suffix or \`.dockerignore\`, a \`*.sh\`/\`*.bash\`/\`*.zsh\`, a \`CLAUDE.md\`/\`CLAUDE.local.md\`/\`AGENTS.md\`, or any extensionless repo-root file or repo-root dotfile), or a binary file, which fold mode never pushes.${EXTRA_HINT} Nothing was committed, so the branch is untouched. Those findings need a human." >> "$GITHUB_OUTPUT"
             emit blocked
             exit 1
           fi
