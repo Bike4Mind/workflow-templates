@@ -61,7 +61,7 @@ on:
         type: string
         default: '24'
       extra_packages:
-        description: Space-separated pnpm filter names to additionally typecheck:fast + test (e.g. "@scope/extra-package"). Default none.
+        description: Space-separated pnpm filter names to additionally typecheck (typecheck:fast where defined, else typecheck) + test (e.g. "@scope/extra-package"). Default none.
         required: false
         type: string
         default: ''
@@ -336,24 +336,38 @@ jobs:
           GLUE_CONSUMERS: ${{ inputs.glue_consumers }}
         run: |
           set -uo pipefail
+          # The host retired typecheck:fast on 2026-11-27 (Bike4Mind/bike4mind#8767): `typecheck`
+          # is now the tsgo-only check that typecheck:fast used to be. Use typecheck:fast where a
+          # package still defines it (an overlay's own extra package), else typecheck. A package
+          # with neither, or a filter that matches no package, is a hard error, so the gate can't
+          # turn itself off.
+          typecheck_script() {
+            local scripts
+            scripts=$(pnpm --filter "$1" exec node -e "process.stdout.write(Object.keys(require('./package.json').scripts || {}).join(' '))" 2>/dev/null | tail -n 1)
+            case " ${scripts} " in
+              *" typecheck:fast "*) echo typecheck:fast ;;
+              *" typecheck "*) echo typecheck ;;
+              *) return 1 ;;
+            esac
+          }
           status=0
           for pkg in ${GLUE_CONSUMERS}; do
             echo "== ${pkg} =="
-            if ! out=$(pnpm --filter "${pkg}" run typecheck:fast 2>&1); then
+            # Silently passing a package with no typecheck script would turn this
+            # gate off without anyone noticing - which is the exact class of
+            # failure it exists to catch - so treat it as a hard error.
+            if ! script=$(typecheck_script "${pkg}"); then
+              echo "::error::${pkg} has no typecheck or typecheck:fast script (or the filter matches no package), so this gate is not gating. Fix the filter name or add the script."
+              status=1
+              continue
+            fi
+            if ! out=$(pnpm --filter "${pkg}" run "${script}" 2>&1); then
               printf '%s\n' "${out}"
               echo "::error::${pkg} does not typecheck with overlay ${{ inputs.overlay_name }} composed in. If this is an unresolvable @bike4mind/premium-* import, the generated glue in that package needs a relative import (see generateInfraGlue) or the package needs the overlay wired into its deps."
               status=1
               continue
             fi
             printf '%s\n' "${out}"
-            # pnpm exits 0 when the filter matches a package that simply has no
-            # such script. Silently passing would turn this gate off without
-            # anyone noticing - which is the exact class of failure it exists to
-            # catch - so treat it as a hard error.
-            if printf '%s' "${out}" | grep -q "None of the selected packages has a script"; then
-              echo "::error::${pkg} has no typecheck:fast script, so this gate is not gating. Fix the filter name or add the script."
-              status=1
-            fi
           done
           exit "${status}"
 
@@ -362,8 +376,27 @@ jobs:
         env:
           EXTRA_PACKAGES: ${{ inputs.extra_packages }}
         run: |
+          set -euo pipefail
+          # The host retired typecheck:fast on 2026-11-27 (Bike4Mind/bike4mind#8767): `typecheck`
+          # is now the tsgo-only check that typecheck:fast used to be. Use typecheck:fast where a
+          # package still defines it (an overlay's own extra package), else typecheck. A package
+          # with neither, or a filter that matches no package, is a hard error, so the gate can't
+          # turn itself off.
+          typecheck_script() {
+            local scripts
+            scripts=$(pnpm --filter "$1" exec node -e "process.stdout.write(Object.keys(require('./package.json').scripts || {}).join(' '))" 2>/dev/null | tail -n 1)
+            case " ${scripts} " in
+              *" typecheck:fast "*) echo typecheck:fast ;;
+              *" typecheck "*) echo typecheck ;;
+              *) return 1 ;;
+            esac
+          }
           for pkg in ${EXTRA_PACKAGES}; do
             echo "== ${pkg} =="
-            pnpm --filter "${pkg}" run typecheck:fast
+            if ! script=$(typecheck_script "${pkg}"); then
+              echo "::error::${pkg} has no typecheck or typecheck:fast script (or the filter matches no package)."
+              exit 1
+            fi
+            pnpm --filter "${pkg}" run "${script}"
             pnpm --filter "${pkg}" run test
           done
